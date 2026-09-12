@@ -1,0 +1,527 @@
+import {
+  AuthorizationError,
+  OAuthProvider,
+  getOAuthApi,
+  type AuthRequest,
+  type OAuthProviderOptions,
+} from '@cloudflare/workers-oauth-provider';
+import { WorkerEntrypoint } from 'cloudflare:workers';
+import { BridgeError, MAX_TASK_ATTACHMENT_BYTES, safeEqual, validateAttachments, validateResult } from './validation';
+
+export { safeEqual, validateAttachments, validateResult } from './validation';
+
+export interface Env {
+  DB: D1Database;
+  ATTACHMENTS: R2Bucket;
+  OAUTH_KV: KVNamespace;
+  ENVIRONMENT: string;
+  CODEX_TOKEN: string;
+  GROK_TOKEN: string;
+  GROK_OAUTH_LOGIN_CODE: string;
+  ATTACHMENT_SIGNING_SECRET: string;
+  PUBLIC_BASE_URL: string;
+}
+
+type Client = 'codex' | 'grok';
+type Scope = 'task:create' | 'task:read' | 'task:cancel' | 'task:claim' | 'task:progress' | 'task:complete';
+type TaskStatus = 'queued' | 'claimed' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+type AttachmentDirection = 'input' | 'result';
+
+const PROTOCOL_VERSION = '2025-03-26';
+const LEASE_MINUTES = 15;
+const ATTACHMENT_UPLOAD_MINUTES = 15;
+const ATTACHMENT_RETENTION_DAYS = 7;
+const OAUTH_FLOW_TTL_SECONDS = 600;
+const GROK_OAUTH_SCOPES: Scope[] = ['task:read', 'task:claim', 'task:progress', 'task:complete'];
+const MAX_RESULT_BYTES = 500 * 1024;
+const TERMINAL = new Set<TaskStatus>(['succeeded', 'failed', 'cancelled']);
+
+const TOOL_DEFINITIONS = [
+  tool('create_task', 'Create a Codex task for Grok Bot.', {
+    type: 'object', required: ['source', 'task_type', 'title', 'instructions', 'idempotency_key'],
+    properties: {
+      source: { type: 'string', enum: ['codex'] },
+      task_type: { type: 'string', enum: ['codex_research'] },
+      title: { type: 'string', minLength: 1, maxLength: 200 },
+      instructions: { type: 'string', minLength: 1, maxLength: 50000 },
+      acceptance_criteria: { type: 'string', maxLength: 10000 },
+      priority: { type: 'integer', minimum: 0, maximum: 100 },
+      idempotency_key: { type: 'string', minLength: 8, maxLength: 200 },
+      attachments: { type: 'array', maxItems: 20, items: { type: 'object' } },
+    },
+  }),
+  tool('get_task', 'Read a task, progress events, result, and attachment URLs.', {
+    type: 'object', required: ['task_id'], properties: { task_id: { type: 'string' } },
+  }),
+  tool('list_tasks', 'List tasks visible to the authenticated client.', {
+    type: 'object', properties: {
+      status: { type: 'string' }, source: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 },
+    },
+  }),
+  tool('cancel_task', 'Cancel a queued or claimed task.', {
+    type: 'object', required: ['task_id', 'idempotency_key'], properties: { task_id: { type: 'string' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
+  }),
+  tool('claim_next_task', 'Atomically claim the next eligible task for Grok Bot.', {
+    type: 'object', required: ['idempotency_key'], properties: { task_type: { type: 'string' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
+  }),
+  tool('renew_task_lease', 'Renew the current Grok Bot task lease.', {
+    type: 'object', required: ['task_id'], properties: { task_id: { type: 'string' } },
+  }),
+  tool('append_progress', 'Append progress to a claimed Grok Bot task.', {
+    type: 'object', required: ['task_id', 'message'], properties: { task_id: { type: 'string' }, message: { type: 'string', maxLength: 5000 } },
+  }),
+  tool('complete_task', 'Complete a Grok Bot task with a structured evidence result.', {
+    type: 'object', required: ['task_id', 'result', 'idempotency_key'], properties: { task_id: { type: 'string' }, result: { type: 'object' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
+  }),
+  tool('fail_task', 'Fail or requeue a Grok Bot task.', {
+    type: 'object', required: ['task_id', 'error', 'idempotency_key'], properties: { task_id: { type: 'string' }, error: { type: 'object' }, retryable: { type: 'boolean' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
+  }),
+  tool('prepare_result_attachment', 'Reserve a small result attachment slot and return a signed upload URL.', {
+    type: 'object', required: ['task_id', 'name', 'mime_type', 'size_bytes'], properties: { task_id: { type: 'string' }, name: { type: 'string' }, mime_type: { type: 'string' }, size_bytes: { type: 'integer' } },
+  }),
+];
+
+const TOOL_REQUIRED_SCOPE: Record<string, Scope> = {
+  create_task: 'task:create',
+  get_task: 'task:read',
+  list_tasks: 'task:read',
+  cancel_task: 'task:cancel',
+  claim_next_task: 'task:claim',
+  renew_task_lease: 'task:progress',
+  append_progress: 'task:progress',
+  complete_task: 'task:complete',
+  fail_task: 'task:progress',
+  prepare_result_attachment: 'task:progress',
+};
+
+function tool(name: string, description: string, inputSchema: Record<string, unknown>) {
+  return { name, description, inputSchema };
+}
+
+interface OAuthProps { client: 'grok'; scopes: Scope[]; }
+
+function oauthOptionsFor(env: Env): OAuthProviderOptions<Env> {
+  const baseUrl = env.PUBLIC_BASE_URL.replace(/\/$/, '');
+  return {
+  apiRoute: '/grok/mcp',
+  apiHandler: class GrokOAuthApi extends WorkerEntrypoint<Env, OAuthProps> {
+    fetch(request: Request) {
+      const auth: AuthContext = { client: this.ctx.props.client, scopes: new Set(this.ctx.props.scopes) };
+      return handleMcp(request, this.env, auth);
+    }
+  },
+  defaultHandler: {
+    fetch(request, env) { return handleOAuthAuthorization(request, env); },
+  },
+  authorizeEndpoint: '/oauth/authorize',
+  tokenEndpoint: '/oauth/token',
+  clientRegistrationEndpoint: '/oauth/register',
+  scopesSupported: GROK_OAUTH_SCOPES,
+  resourceMetadata: {
+    resource: `${baseUrl}/grok/mcp`,
+    scopes_supported: GROK_OAUTH_SCOPES,
+    resource_name: 'Codex Grok Bot Task Bridge',
+  },
+  clientRegistrationCallback: ({ clientMetadata }) => validateOAuthClientRegistration(clientMetadata),
+  accessTokenTTL: 3600,
+  refreshTokenTTL: 60 * 60 * 24 * 30,
+  clientRegistrationTTL: undefined,
+  };
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    let requestId: JSONRPCRequest['id'] = null;
+    try {
+      const url = new URL(request.url);
+      if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, environment: env.ENVIRONMENT });
+      if (url.pathname.startsWith('/attachments/')) return handleAttachment(request, env, url);
+      if (url.pathname === '/mcp') return handleMcp(request, env);
+      return await new OAuthProvider<Env>(oauthOptionsFor(env)).fetch(request, env, ctx);
+    } catch (error) {
+      console.error(JSON.stringify({ error: classifyError(error) }));
+      if (error instanceof BridgeError) return rpcError(requestId, -32000, `${error.code}: ${error.message}`);
+      return json({ error: 'internal_error' }, 500);
+    }
+  },
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const oauthProvider = new OAuthProvider<Env>(oauthOptionsFor(env));
+    ctx.waitUntil(Promise.all([reconcileExpired(env), oauthProvider.purgeExpiredData(env)]).then(() => undefined));
+  },
+};
+
+async function handleMcp(request: Request, env: Env, suppliedAuth?: AuthContext): Promise<Response> {
+  let requestId: JSONRPCRequest['id'] = null;
+  try {
+    if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { Allow: 'POST' });
+    const auth = suppliedAuth ?? authenticate(request, env);
+    if (!auth) return json({ error: 'unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer' });
+    const body = await request.json<JSONRPCRequest>();
+    requestId = body.id;
+    if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') return rpcError(body.id, -32600, 'Invalid JSON-RPC request');
+    if (body.method === 'notifications/initialized' || body.method.startsWith('notifications/')) return new Response(null, { status: 204 });
+    if (body.method === 'initialize') return rpcResult(body.id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'codex-grok-task-bridge', version: '0.1.0' } });
+    if (body.method === 'ping') return rpcResult(body.id, {});
+    if (body.method === 'tools/list') return rpcResult(body.id, { tools: TOOL_DEFINITIONS.filter((item) => auth.scopes.has(TOOL_REQUIRED_SCOPE[item.name])) });
+    if (body.method !== 'tools/call') return rpcError(body.id, -32601, 'Method not found');
+    const params = body.params as { name?: string; arguments?: Record<string, unknown> } | undefined;
+    if (!params?.name) return rpcError(body.id, -32602, 'Tool name is required');
+    const result = await callTool(params.name, params.arguments ?? {}, auth, env);
+    return rpcResult(body.id, { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result });
+  } catch (error) {
+    console.error(JSON.stringify({ error: classifyError(error) }));
+    if (error instanceof BridgeError) return rpcError(requestId, -32000, `${error.code}: ${error.message}`);
+    return json({ error: 'internal_error' }, 500);
+  }
+}
+
+async function handleOAuthAuthorization(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.pathname !== '/oauth/authorize') return json({ error: 'not_found' }, 404);
+  const oauth = getOAuthApi(oauthOptionsFor(env), env);
+  if (request.method === 'GET') {
+    let authRequest: AuthRequest;
+    try {
+      authRequest = await oauth.parseAuthRequest(request);
+    } catch (error) {
+      if (!(error instanceof AuthorizationError)) throw error;
+      return oauthErrorPage(error.description, 400);
+    }
+    if (authRequest.scope.length === 0) return oauthErrorPage('OAuth 客户端必须明确请求最小权限范围。', 400);
+    const client = await oauth.lookupClient(authRequest.clientId);
+    if (!client) return oauthErrorPage('无法识别 OAuth 客户端。', 400);
+    const flowId = crypto.randomUUID();
+    const csrf = crypto.randomUUID();
+    await env.OAUTH_KV.put(`grok-oauth-flow:${flowId}`, JSON.stringify(authRequest), { expirationTtl: OAUTH_FLOW_TTL_SECONDS });
+    return new Response(oauthConsentPage(client.clientName ?? 'Grok Connector', csrf, flowId, false, authRequest.scope as Scope[]), {
+      headers: oauthHtmlHeaders(`__Host-GROK-OAUTH-CSRF=${csrf}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${OAUTH_FLOW_TTL_SECONDS}`),
+    });
+  }
+  if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { Allow: 'GET, POST' });
+  const contentLength = Number(request.headers.get('content-length') ?? 0);
+  if (contentLength > 4096) return json({ error: 'request_too_large' }, 413);
+  const form = await request.formData();
+  const flowId = String(form.get('flow_id') ?? '');
+  const csrf = String(form.get('csrf_token') ?? '');
+  const cookieCsrf = readCookie(request, '__Host-GROK-OAUTH-CSRF');
+  const csrfMatches = Boolean(csrf && cookieCsrf && safeEqual(csrf, cookieCsrf));
+  if (!/^[0-9a-f-]{36}$/i.test(flowId) || !csrf || !cookieCsrf || !csrfMatches) return oauthErrorPage('授权会话无效或已过期，请从 Grok 连接器重新开始。', 400);
+  const flowKey = `grok-oauth-flow:${flowId}`;
+  const serialized = await env.OAUTH_KV.get(flowKey);
+  if (!serialized) return oauthErrorPage('授权会话已过期，请从 Grok 连接器重新开始。', 400);
+  const loginCode = String(form.get('login_code') ?? '');
+  if (!env.GROK_OAUTH_LOGIN_CODE || !safeEqual(loginCode, env.GROK_OAUTH_LOGIN_CODE)) {
+    const pendingRequest = JSON.parse(serialized) as AuthRequest;
+    const client = await oauth.lookupClient(pendingRequest.clientId);
+    return new Response(oauthConsentPage(client?.clientName ?? 'Grok Connector', csrf, flowId, true, pendingRequest.scope as Scope[]), {
+      status: 401,
+      headers: oauthHtmlHeaders(`__Host-GROK-OAUTH-CSRF=${csrf}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${OAUTH_FLOW_TTL_SECONDS}`),
+    });
+  }
+  await env.OAUTH_KV.delete(flowKey);
+  const authRequest = JSON.parse(serialized) as AuthRequest;
+  const client = await oauth.lookupClient(authRequest.clientId);
+  if (!client) return oauthErrorPage('OAuth 客户端已失效，请从 Grok 连接器重新开始。', 400);
+  const requested = authRequest.scope.length ? authRequest.scope : GROK_OAUTH_SCOPES;
+  if (requested.some((scope) => !GROK_OAUTH_SCOPES.includes(scope as Scope))) return oauthErrorPage('该连接器请求了不支持的权限。', 400);
+  const grantedScopes = [...new Set(requested as Scope[])];
+  const { redirectTo } = await oauth.completeAuthorization({
+    request: authRequest,
+    userId: 'bridge-owner',
+    metadata: { clientName: client.clientName ?? 'Grok Connector' },
+    scope: grantedScopes,
+    props: { client: 'grok', scopes: grantedScopes },
+  });
+  return Response.redirect(redirectTo, 302);
+}
+
+function validateOAuthClientRegistration(metadata: Record<string, unknown>) {
+  const name = typeof metadata.client_name === 'string' ? metadata.client_name : '';
+  const redirects = metadata.redirect_uris;
+  if (!/grok|x\.ai/i.test(name) || !Array.isArray(redirects) || redirects.length === 0 || redirects.length > 10) {
+    return { code: 'invalid_client_metadata', description: 'Only Grok OAuth clients with HTTPS callback URLs can register.' };
+  }
+  const allowedHosts = ['grok.com', 'x.ai', 'cursor.com', 'cursor.sh'];
+  const validRedirects = redirects.every((value) => {
+    if (typeof value !== 'string') return false;
+    try {
+      const uri = new URL(value);
+      return uri.protocol === 'https:' && !uri.username && !uri.password && allowedHosts.some((host) => uri.hostname === host || uri.hostname.endsWith(`.${host}`));
+    } catch { return false; }
+  });
+  if (!validRedirects) return { code: 'invalid_client_metadata', description: 'OAuth callbacks must use an approved Grok or xAI HTTPS domain.' };
+  return undefined;
+}
+
+function oauthConsentPage(clientName: string, csrf: string, flowId: string, invalidCode: boolean, scopes: Scope[]) {
+  const permissions = [...new Set(scopes)].map((scope) => `<li>${escapeHtml(scopeDescription(scope))}</li>`).join('');
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>授权 Codex Grok Bot 任务桥</title><body><main><h1>授权 Codex Grok Bot 任务桥</h1><p>客户端：<strong>${escapeHtml(clientName)}</strong></p><p>授权后，此 Grok Connector 可领取并处理 Codex 提交的任务。它不能创建或取消任务，也不能写入外部知识库或协作平台。</p><ul>${permissions}</ul>${invalidCode ? '<p role="alert">授权码不正确，请重试。</p>' : ''}<form method="post" action="/oauth/authorize"><input type="hidden" name="flow_id" value="${escapeHtml(flowId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><label for="login_code">任务桥授权码</label><input id="login_code" name="login_code" type="password" autocomplete="off" required maxlength="256"><button type="submit">批准并连接 Grok</button></form><p>若不是你本人发起，请关闭此页面。授权码只用于此任务桥登录，不要粘贴到聊天内容。</p></main></body></html>`;
+}
+
+function oauthErrorPage(message: string, status: number) {
+  return new Response(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>任务桥授权失败</title><body><main><h1>无法完成授权</h1><p>${escapeHtml(message)}</p></main></body></html>`, { status, headers: oauthHtmlHeaders() });
+}
+
+function oauthHtmlHeaders(cookie?: string) {
+  const headers = new Headers({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" });
+  if (cookie) headers.set('Set-Cookie', cookie);
+  return headers;
+}
+
+function readCookie(request: Request, name: string) {
+  const prefix = `${name}=`;
+  return request.headers.get('Cookie')?.split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length) ?? '';
+}
+
+function escapeHtml(value: string) { return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
+function scopeDescription(scope: Scope): string {
+  const descriptions: Record<Scope, string> = {
+    'task:create': '创建新任务',
+    'task:read': '读取任务及其结果',
+    'task:cancel': '取消尚未执行的任务',
+    'task:claim': '领取一个待处理任务',
+    'task:progress': '更新进度与租约',
+    'task:complete': '提交任务结果或失败状态',
+  };
+  return descriptions[scope];
+}
+
+interface JSONRPCRequest { jsonrpc?: string; id?: string | number | null; method: string; params?: unknown; }
+interface AuthContext { client: Client; scopes: Set<Scope>; }
+
+function authenticate(request: Request, env: Env): AuthContext | null {
+  const header = request.headers.get('Authorization') ?? '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) return null;
+  if (safeEqual(token, env.CODEX_TOKEN ?? '')) return { client: 'codex', scopes: new Set(['task:create', 'task:read', 'task:cancel']) };
+  if (safeEqual(token, env.GROK_TOKEN ?? '')) return { client: 'grok', scopes: new Set(['task:read', 'task:claim', 'task:progress', 'task:complete']) };
+  return null;
+}
+
+async function callTool(name: string, args: Record<string, unknown>, auth: AuthContext, env: Env): Promise<Record<string, unknown>> {
+  switch (name) {
+    case 'create_task': requireScope(auth, 'task:create'); return createTask(args, auth, env);
+    case 'get_task': requireScope(auth, 'task:read'); return getTask(String(args.task_id ?? ''), auth, env);
+    case 'list_tasks': requireScope(auth, 'task:read'); return listTasks(args, auth, env);
+    case 'cancel_task': requireScope(auth, 'task:cancel'); return cancelTask(args, auth, env);
+    case 'claim_next_task': requireScope(auth, 'task:claim'); return claimNextTask(args, env);
+    case 'renew_task_lease': requireScope(auth, 'task:progress'); return renewLease(String(args.task_id ?? ''), env);
+    case 'append_progress': requireScope(auth, 'task:progress'); return appendProgress(args, env);
+    case 'complete_task': requireScope(auth, 'task:complete'); return completeTask(args, env);
+    case 'fail_task': requireScope(auth, 'task:progress'); return failTask(args, env);
+    case 'prepare_result_attachment': requireScope(auth, 'task:progress'); return prepareResultAttachment(args, env);
+    default: throw new BridgeError('tool_not_found', `Unknown tool: ${name}`);
+  }
+}
+
+async function createTask(args: Record<string, unknown>, auth: AuthContext, env: Env) {
+  const source = String(args.source ?? '');
+  if (source !== auth.client || source !== 'codex') throw new BridgeError('forbidden', 'source does not match authenticated client');
+  const taskType = String(args.task_type ?? '');
+  if (taskType !== 'codex_research') throw new BridgeError('invalid_task_type', 'Codex may only create codex_research tasks');
+  if (source === 'codex' && taskType !== 'codex_research') throw new BridgeError('invalid_task_type', 'Codex may only create codex_research tasks');
+  const title = cleanText(args.title, 200);
+  const instructions = cleanText(args.instructions, 50000);
+  const acceptance = cleanOptionalText(args.acceptance_criteria, 10000);
+  const idempotencyKey = cleanText(args.idempotency_key, 200);
+  if (idempotencyKey.length < 8) throw new BridgeError('invalid_idempotency_key', 'idempotency_key must have at least 8 characters');
+  const existing = await env.DB.prepare('SELECT id FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string }>();
+  if (existing) return getTask(existing.id, auth, env);
+  const attachments = validateAttachments(args.attachments);
+  const now = new Date().toISOString();
+  const taskId = crypto.randomUUID();
+  const rawPriority = Number(args.priority ?? 50); if (!Number.isInteger(rawPriority)) throw new BridgeError('invalid_priority', 'priority must be an integer');
+  const priority = Math.max(0, Math.min(100, rawPriority));
+  const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO tasks (id, source, task_type, title, instructions, acceptance_criteria, priority, status, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`).bind(taskId, source, taskType, title, instructions, acceptance, priority, idempotencyKey, now, now), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'created', auth.client, '{}', now)];
+  const responseAttachments: Record<string, unknown>[] = [];
+  for (const item of attachments) {
+    const id = crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + ATTACHMENT_RETENTION_DAYS * 86400000).toISOString();
+    const key = `${env.ENVIRONMENT}/${taskId}/${id}/${item.name}`;
+    statements.push(env.DB.prepare('INSERT INTO attachments (id, task_id, name, mime_type, size_bytes, object_key, upload_status, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, \'pending\', ?, ?)').bind(id, taskId, item.name, item.mimeType, item.sizeBytes, key, expiresAt, now));
+    responseAttachments.push({ id, name: item.name, mime_type: item.mimeType, size_bytes: item.sizeBytes, upload_url: await signedAttachmentUrl(env, taskId, id, 'upload', ATTACHMENT_UPLOAD_MINUTES) });
+  }
+  await env.DB.batch(statements);
+  return { task_id: taskId, status: 'queued', expires_at: new Date(Date.now() + ATTACHMENT_RETENTION_DAYS * 86400000).toISOString(), attachments: responseAttachments };
+}
+
+async function getTask(taskId: string, auth: AuthContext, env: Env) {
+  if (!taskId) throw new BridgeError('invalid_task_id', 'task_id is required');
+  const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(taskId).first<Record<string, unknown>>();
+  if (!task) throw new BridgeError('not_found', 'Task not found');
+  if (auth.client !== 'grok' && task.source !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another source');
+  if (auth.client === 'grok' && task.lease_owner !== 'grok') throw new BridgeError('forbidden', 'Task is not assigned to Grok Bot');
+  const events = await env.DB.prepare('SELECT event_type, actor, payload_json, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC').bind(taskId).all<Record<string, string>>();
+  const attachments = await env.DB.prepare('SELECT id, name, mime_type, size_bytes, direction, upload_status, sha256, expires_at FROM attachments WHERE task_id = ?').bind(taskId).all<Record<string, string>>();
+  const attachmentResults = await Promise.all((attachments.results ?? []).map(async (item) => ({ ...item, download_url: item.upload_status === 'uploaded' && item.expires_at > new Date().toISOString() ? await signedAttachmentUrl(env, taskId, item.id, 'download', ATTACHMENT_RETENTION_DAYS * 24 * 60) : null })));
+  return { task_id: task.id, source: task.source, task_type: task.task_type, title: task.title, status: task.status, attempts: task.attempts, created_at: task.created_at, updated_at: task.updated_at, result: parseJson(task.result_json), error: parseJson(task.error_json), events: (events.results ?? []).map((e) => ({ ...e, payload: parseJson(e.payload_json) })), attachments: attachmentResults };
+}
+
+async function listTasks(args: Record<string, unknown>, auth: AuthContext, env: Env) {
+  const limit = Math.max(1, Math.min(50, Number(args.limit ?? 20)));
+  const status = String(args.status ?? '');
+  const source = auth.client === 'grok' ? (args.source ? String(args.source) : '') : auth.client;
+  const clauses = auth.client === 'grok' ? ["lease_owner = 'grok'"] : ['1 = 1']; const values: (string | number)[] = [];
+  if (source) { clauses.push('source = ?'); values.push(source); }
+  if (status) { clauses.push('status = ?'); values.push(status); }
+  const result = await env.DB.prepare(`SELECT id, source, task_type, title, status, attempts, created_at, updated_at FROM tasks WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC LIMIT ?`).bind(...values, limit).all();
+  return { tasks: result.results ?? [] };
+}
+
+async function cancelTask(args: Record<string, unknown>, auth: AuthContext, env: Env) {
+  const taskId = String(args.task_id ?? '');
+  const operationKey = requireIdempotencyKey(args.idempotency_key);
+  const previous = await readIdempotent(env, auth.client, 'cancel_task', operationKey);
+  if (previous) return previous;
+  const task = await env.DB.prepare('SELECT status, source FROM tasks WHERE id = ?').bind(taskId).first<{ status: TaskStatus; source: Client }>();
+  if (!task) throw new BridgeError('not_found', 'Task not found');
+  if (task.source !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another source');
+  if (task.status === 'running') throw new BridgeError('external_work_started', 'Running tasks cannot be cancelled after execution starts');
+  if (TERMINAL.has(task.status)) {
+    const response = { task_id: taskId, status: task.status };
+    await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response);
+    return response;
+  }
+  const now = new Date().toISOString();
+  await env.DB.batch([env.DB.prepare("UPDATE tasks SET status = 'cancelled', updated_at = ?, completed_at = ? WHERE id = ? AND status IN ('queued', 'claimed')").bind(now, now, taskId), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'cancelled', auth.client, '{}', now)]);
+  const response = { task_id: taskId, status: 'cancelled' };
+  await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response);
+  return response;
+}
+
+async function claimNextTask(args: Record<string, unknown>, env: Env) {
+  const operationKey = requireIdempotencyKey(args.idempotency_key);
+  const previous = await readIdempotent(env, 'grok', 'claim_next_task', operationKey);
+  if (previous) return previous;
+  const taskType = args.task_type ? String(args.task_type) : '';
+  if (taskType && !['codex_research', 'research_evidence', 'browser_collection'].includes(taskType)) throw new BridgeError('invalid_task_type', 'Unsupported task type');
+  const now = new Date(); const nowText = now.toISOString(); const expires = new Date(now.getTime() + LEASE_MINUTES * 60000).toISOString();
+  const expired = await env.DB.prepare("SELECT id FROM tasks WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(nowText).all<{ id: string }>();
+  await env.DB.prepare("UPDATE tasks SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(nowText, nowText).run();
+  if ((expired.results ?? []).length) await env.DB.batch((expired.results ?? []).map((expiredTask) => env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(expiredTask.id, 'lease_expired_requeued', 'system', '{}', nowText)));
+  const query = taskType ? `UPDATE tasks SET status = 'claimed', lease_owner = 'grok', lease_expires_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = (SELECT id FROM tasks WHERE status = 'queued' AND task_type = ? AND attempts < max_attempts ORDER BY priority DESC, created_at ASC LIMIT 1) AND status = 'queued' RETURNING id` : `UPDATE tasks SET status = 'claimed', lease_owner = 'grok', lease_expires_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = (SELECT id FROM tasks WHERE status = 'queued' AND attempts < max_attempts ORDER BY priority DESC, created_at ASC LIMIT 1) AND status = 'queued' RETURNING id`;
+  const claimed = taskType ? await env.DB.prepare(query).bind(expires, nowText, taskType).first<{ id: string }>() : await env.DB.prepare(query).bind(expires, nowText).first<{ id: string }>();
+  if (!claimed) {
+    const response = { task: null };
+    await writeIdempotent(env, 'grok', 'claim_next_task', operationKey, null, response);
+    return response;
+  }
+  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(claimed.id, 'claimed', 'grok', JSON.stringify({ lease_expires_at: expires }), nowText).run();
+  const response = { task: await getTask(claimed.id, { client: 'grok', scopes: new Set(['task:read']) }, env) };
+  await writeIdempotent(env, 'grok', 'claim_next_task', operationKey, claimed.id, response);
+  return response;
+}
+
+async function reconcileExpired(env: Env) {
+  const now = new Date().toISOString();
+  const expired = await env.DB.prepare("SELECT id FROM tasks WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(now).all<{ id: string }>();
+  await env.DB.prepare("UPDATE tasks SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(now, now).run();
+  for (const item of expired.results ?? []) await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(item.id, 'lease_expired_requeued', 'system', '{}', now).run();
+  const attachments = await env.DB.prepare("SELECT id, object_key FROM attachments WHERE expires_at <= ? AND upload_status != 'expired' LIMIT 500").bind(now).all<{ id: string; object_key: string }>();
+  if (attachments.results?.length) await env.ATTACHMENTS.delete(attachments.results.map((item) => item.object_key));
+  for (const item of attachments.results ?? []) await env.DB.prepare("UPDATE attachments SET upload_status = 'expired' WHERE id = ?").bind(item.id).run();
+  await env.DB.prepare("DELETE FROM operation_idempotency WHERE created_at <= datetime('now', '-30 days')").run();
+}
+
+async function renewLease(taskId: string, env: Env) {
+  const task = await ownedTask(taskId, env, ['claimed', 'running']);
+  const expires = new Date(Date.now() + LEASE_MINUTES * 60000).toISOString();
+  await env.DB.prepare('UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_owner = \'grok\'').bind(expires, new Date().toISOString(), taskId).run();
+  return { task_id: taskId, lease_expires_at: expires };
+}
+
+async function appendProgress(args: Record<string, unknown>, env: Env) {
+  const taskId = String(args.task_id ?? ''); const message = cleanText(args.message, 5000); await ownedTask(taskId, env, ['claimed', 'running']);
+  const now = new Date().toISOString();
+  await env.DB.batch([env.DB.prepare("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND lease_owner = 'grok'").bind(now, taskId), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'progress', 'grok', JSON.stringify({ message }), now)]);
+  return { task_id: taskId, status: 'running', message };
+}
+
+async function completeTask(args: Record<string, unknown>, env: Env) {
+  const taskId = String(args.task_id ?? ''); const operationKey = requireIdempotencyKey(args.idempotency_key);
+  const previous = await readIdempotent(env, 'grok', 'complete_task', operationKey); if (previous) return previous;
+  await ownedTask(taskId, env, ['claimed', 'running']);
+  const result = validateResult(args.result);
+  const serialized = JSON.stringify(result); if (serialized.length > MAX_RESULT_BYTES) throw new BridgeError('result_too_large', 'result exceeds 500 KB');
+  const now = new Date().toISOString();
+  await env.DB.batch([env.DB.prepare("UPDATE tasks SET status = 'succeeded', result_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, completed_at = ? WHERE id = ? AND lease_owner = 'grok'").bind(serialized, now, now, taskId), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'completed', 'grok', serialized, now)]);
+  const response = { task_id: taskId, status: 'succeeded', result };
+  await writeIdempotent(env, 'grok', 'complete_task', operationKey, taskId, response);
+  return response;
+}
+
+async function failTask(args: Record<string, unknown>, env: Env) {
+  const taskId = String(args.task_id ?? ''); const operationKey = requireIdempotencyKey(args.idempotency_key);
+  const previous = await readIdempotent(env, 'grok', 'fail_task', operationKey); if (previous) return previous;
+  await ownedTask(taskId, env, ['claimed', 'running']);
+  const error = args.error && typeof args.error === 'object' ? args.error : { message: cleanText(args.error, 2000) }; const retryable = args.retryable === true;
+  const current = await env.DB.prepare('SELECT attempts, max_attempts FROM tasks WHERE id = ?').bind(taskId).first<{ attempts: number; max_attempts: number }>();
+  const shouldRetry = retryable && current && current.attempts < current.max_attempts;
+  const status = shouldRetry ? 'queued' : 'failed'; const now = new Date().toISOString();
+  await env.DB.batch([env.DB.prepare(`UPDATE tasks SET status = ?, error_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?${shouldRetry ? '' : ', completed_at = ?'} WHERE id = ? AND lease_owner = 'grok'`).bind(...(shouldRetry ? [status, JSON.stringify(error), now, taskId] : [status, JSON.stringify(error), now, now, taskId])), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, status === 'queued' ? 'requeued' : 'failed', 'grok', JSON.stringify(error), now)]);
+  const response = { task_id: taskId, status };
+  await writeIdempotent(env, 'grok', 'fail_task', operationKey, taskId, response);
+  return response;
+}
+
+async function prepareResultAttachment(args: Record<string, unknown>, env: Env) {
+  const taskId = String(args.task_id ?? '');
+  await ownedTask(taskId, env, ['claimed', 'running']);
+  const [item] = validateAttachments([{ name: args.name, mime_type: args.mime_type, size_bytes: args.size_bytes }]);
+  const used = await env.DB.prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM attachments WHERE task_id = ?').bind(taskId).first<{ total: number }>();
+  if (Number(used?.total ?? 0) + item.sizeBytes > MAX_TASK_ATTACHMENT_BYTES) throw new BridgeError('attachments_too_large', 'Task attachments exceed 25 MB');
+  const id = crypto.randomUUID(); const now = new Date().toISOString(); const expiresAt = new Date(Date.now() + ATTACHMENT_RETENTION_DAYS * 86400000).toISOString();
+  const key = `${env.ENVIRONMENT}/${taskId}/${id}/${item.name}`;
+  await env.DB.prepare("INSERT INTO attachments (id, task_id, name, mime_type, direction, size_bytes, object_key, upload_status, expires_at, created_at) VALUES (?, ?, ?, ?, 'result', ?, ?, 'pending', ?, ?)").bind(id, taskId, item.name, item.mimeType, item.sizeBytes, key, expiresAt, now).run();
+  return { attachment_id: id, upload_url: await signedAttachmentUrl(env, taskId, id, 'upload', ATTACHMENT_UPLOAD_MINUTES), expires_at: expiresAt };
+}
+
+async function ownedTask(taskId: string, env: Env, statuses: TaskStatus[]) {
+  if (!taskId) throw new BridgeError('invalid_task_id', 'task_id is required');
+  const task = await env.DB.prepare('SELECT id, status FROM tasks WHERE id = ? AND lease_owner = \'grok\'').bind(taskId).first<{ id: string; status: TaskStatus }>();
+  if (!task || !statuses.includes(task.status)) throw new BridgeError('lease_not_owned', 'Task is not owned by the current Grok lease');
+  return task;
+}
+
+async function handleAttachment(request: Request, env: Env, url: URL) {
+  const parts = url.pathname.split('/').filter(Boolean); if (parts.length !== 3) return json({ error: 'not_found' }, 404);
+  const [, taskId, attachmentId] = parts; const action = url.searchParams.get('action'); const expires = Number(url.searchParams.get('expires')); const signature = url.searchParams.get('sig') ?? '';
+  if (!action || !['upload', 'download'].includes(action) || !Number.isFinite(expires) || expires < Date.now()) return json({ error: 'expired_attachment_url' }, 403);
+  if (!await verifySignature(env, `${taskId}:${attachmentId}:${action}:${expires}`, signature)) return json({ error: 'invalid_attachment_signature' }, 403);
+  const attachment = await env.DB.prepare('SELECT * FROM attachments WHERE id = ? AND task_id = ?').bind(attachmentId, taskId).first<Record<string, string>>(); if (!attachment) return json({ error: 'not_found' }, 404);
+  if (action === 'upload') {
+    if (request.method !== 'PUT') return json({ error: 'method_not_allowed' }, 405);
+    if (attachment.upload_status !== 'pending') return json({ error: 'attachment_already_uploaded' }, 409);
+    if (Number(request.headers.get('content-length') ?? 0) > Number(attachment.size_bytes)) return json({ error: 'attachment_too_large' }, 413);
+    const body = await request.arrayBuffer(); if (body.byteLength !== Number(attachment.size_bytes)) return json({ error: 'attachment_size_mismatch' }, 400);
+    await env.ATTACHMENTS.put(attachment.object_key, body, { httpMetadata: { contentType: attachment.mime_type } });
+    const hash = await sha256Hex(body); await env.DB.prepare("UPDATE attachments SET upload_status = 'uploaded', sha256 = ? WHERE id = ?").bind(hash, attachmentId).run();
+    return json({ ok: true, sha256: hash });
+  }
+  if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405);
+  const object = await env.ATTACHMENTS.get(attachment.object_key); if (!object) return json({ error: 'attachment_not_uploaded' }, 404);
+  return new Response(object.body, { headers: { 'Content-Type': attachment.mime_type, 'Content-Length': String(attachment.size_bytes), 'Cache-Control': 'private, max-age=60', 'X-Content-Type-Options': 'nosniff' } });
+}
+
+async function signedAttachmentUrl(env: Env, taskId: string, attachmentId: string, action: 'upload' | 'download', minutes: number) {
+  const expires = Date.now() + minutes * 60000; const payload = `${taskId}:${attachmentId}:${action}:${expires}`; const sig = await sign(env.ATTACHMENT_SIGNING_SECRET, payload);
+  const baseUrl = env.PUBLIC_BASE_URL?.replace(/\/$/, '');
+  if (!baseUrl || baseUrl.includes('REPLACE_WITH') || !/^https:\/\//.test(baseUrl) && !/^http:\/\/localhost(?::\d+)?$/.test(baseUrl)) throw new BridgeError('server_misconfigured', 'PUBLIC_BASE_URL must be an HTTPS URL');
+  return `${baseUrl}/attachments/${encodeURIComponent(taskId)}/${encodeURIComponent(attachmentId)}?action=${action}&expires=${expires}&sig=${sig}`;
+}
+
+async function sign(secret: string, payload: string) { const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); const bytes = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload)); return b64url(new Uint8Array(bytes)); }
+async function verifySignature(env: Env, payload: string, signature: string) { return safeEqual(await sign(env.ATTACHMENT_SIGNING_SECRET, payload), signature); }
+function b64url(bytes: Uint8Array) { let binary = ''; bytes.forEach((b) => { binary += String.fromCharCode(b); }); return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', ''); }
+async function sha256Hex(data: ArrayBuffer) { const digest = await crypto.subtle.digest('SHA-256', data); return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join(''); }
+function cleanText(value: unknown, max: number) { const text = String(value ?? '').trim(); if (!text || text.length > max) throw new BridgeError('invalid_text', `Text must be 1-${max} characters`); return text; }
+function cleanOptionalText(value: unknown, max: number) { if (value === undefined || value === null || value === '') return ''; return cleanText(value, max); }
+function requireIdempotencyKey(value: unknown) { const key = cleanText(value, 200); if (key.length < 8) throw new BridgeError('invalid_idempotency_key', 'idempotency_key must have at least 8 characters'); return key; }
+async function readIdempotent(env: Env, actor: Client, operation: string, key: string): Promise<Record<string, unknown> | null> { const row = await env.DB.prepare('SELECT response_json FROM operation_idempotency WHERE actor = ? AND operation = ? AND idempotency_key = ?').bind(actor, operation, key).first<{ response_json: string }>(); return row ? parseJson(row.response_json) as Record<string, unknown> : null; }
+async function writeIdempotent(env: Env, actor: Client, operation: string, key: string, taskId: string | null, response: Record<string, unknown>) { await env.DB.prepare('INSERT OR IGNORE INTO operation_idempotency (actor, operation, idempotency_key, task_id, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(actor, operation, key, taskId, JSON.stringify(response), new Date().toISOString()).run(); }
+function parseJson(value: unknown) { if (typeof value !== 'string' || !value) return null; try { return JSON.parse(value); } catch { return { raw: '[unparseable]' }; } }
+function requireScope(auth: AuthContext, scope: Scope) { if (!auth.scopes.has(scope)) throw new BridgeError('forbidden', `Missing scope: ${scope}`); }
+function classifyError(error: unknown) { return error instanceof BridgeError ? error.code : 'unexpected_error'; }
+function json(value: unknown, status = 200, extra: Record<string, string> = {}) { return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json', ...extra } }); }
+function rpcResult(id: JSONRPCRequest['id'], result: unknown) { return json({ jsonrpc: '2.0', id, result }); }
+function rpcError(id: JSONRPCRequest['id'], code: number, message: string) { return json({ jsonrpc: '2.0', id, error: { code, message } }, 400); }
