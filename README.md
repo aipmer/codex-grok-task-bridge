@@ -54,6 +54,8 @@ npm run smoke
 
 The [Codex ↔ Grok connector protocol smoke test](docs/case-study-codex-grok-smoke-test.md) records a verified handoff after restarting the Codex client. Grok was manually prompted in a grok.com conversation. It covers task creation, claim, progress reporting, completion, and result retrieval; it does not verify an unattended Grok Bot Routine or cloud-computer browser work.
 
+The [public X account research case](docs/case-study-public-x-research-2026-09-13.md) records a read-only task that asked Grok Bot to collect the day's public posts from an X account and return a concise evidence-backed summary. It verifies cloud-browser research through a manually triggered Bot conversation; Routine-based unattended triggering remains a separate capability to verify.
+
 ## Codex and Grok Bot setup
 
 Codex uses the `/mcp` endpoint with a dedicated Bearer token. Grok Bot uses `/grok/mcp` through the OAuth discovery, authorization-code, and PKCE flow. The Grok scope set is limited to:
