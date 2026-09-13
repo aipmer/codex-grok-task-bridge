@@ -48,6 +48,10 @@ For an authenticated end-to-end smoke test, provide `BRIDGE_URL`, `CODEX_TOKEN`,
 npm run smoke
 ```
 
+## Validation case
+
+The [Codex × Grok Bot protocol smoke test](docs/case-study-codex-grok-smoke-test.md) records a verified asynchronous handoff after restarting the Codex client. It covers task creation, Grok claiming, progress reporting, structured completion, and Codex result retrieval. The test uses synthetic evidence and performs no external side effects.
+
 ## Codex and Grok Bot setup
 
 Codex uses the `/mcp` endpoint with a dedicated Bearer token. Grok Bot uses `/grok/mcp` through the OAuth discovery, authorization-code, and PKCE flow. The Grok scope set is limited to:
