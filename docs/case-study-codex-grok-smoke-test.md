@@ -1,20 +1,20 @@
-# Codex × Grok Bot：协议烟测案例
+# Codex ↔ Grok Connector：协议烟测案例
 
-这是一份最小可复现的协议验证记录，用来确认 Codex、任务桥和 Grok Bot Connector 在重启客户端后仍能完成异步交接。它不是一项真实的网页研究，也没有访问登录页面、发送消息或修改外部系统。
+这是一份最小可复现的协议验证记录，用来确认 Codex、任务桥和 Grok Connector 在重启客户端后仍能完成异步交接。执行端是人工提示后的 grok.com 普通对话；本案例没有验证 Grok Bot 的自动 Routine 或云电脑。它不是一项真实的网页研究，也没有访问登录页面、发送消息或修改外部系统。
 
 ## 交接过程
 
 ```text
 Codex create_task
   → queued
-  → Grok Bot claim_next_task
-  → Grok Bot append_progress
-  → Grok Bot complete_task
+  → 人工在 grok.com 对话提示 Grok 调用 claim_next_task
+  → Grok append_progress
+  → Grok complete_task
   → Codex get_task
   → succeeded
 ```
 
-Codex 创建了一个无敏感信息的 `codex_research` 测试任务，并设置了明确的验收标准。Grok Bot 通过已连接的 Custom MCP Connector 完成以下动作：
+Codex 创建了一个无敏感信息的 `codex_research` 测试任务，并设置了明确的验收标准。Grok 在普通网页对话中通过已连接的 Custom MCP Connector 完成以下动作：
 
 1. 原子领取任务并取得租约；
 2. 读取任务说明和验收标准；
@@ -28,7 +28,8 @@ Codex 随后通过 `get_task` 读取到 `succeeded`，并确认只有一次尝�
 - 任务桥的队列、租约、进度事件和结果回传均可用。
 - 重启 Codex 客户端后，已注册的远程 MCP 会自动恢复，无需重新执行 `codex mcp add`。
 - 本案例使用合成证据，仅用于校验结果结构；不应作为事实研究结论引用。
-- Grok Bot 未调用其他连接器，也未执行登录、发布、付款、删除或生产变更。
+- Grok 未调用其他连接器，也未执行登录、发布、付款、删除或生产变更。
+- 自动领取、Grok Bot 对话可见性和云电脑浏览器执行仍需单独验收。
 - 真实网页调查应另行创建任务，并要求返回可核验的来源、观察时间、限制说明和产物地址。
 
 ## Hermes 后续接入
