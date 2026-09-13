@@ -1,5 +1,7 @@
 # Codex × Grok Bot MCP Task Bridge
 
+[Chinese README](README.zh-CN.md)
+
 Open-source MCP task bridge for Codex and Grok Bot, with asynchronous jobs, leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2. Codex creates a task; a connected executor claims it and returns structured results and evidence.
 
 This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.1.
@@ -96,15 +98,15 @@ The connector is invoked by a conversation or a scheduled Routine. A Custom MCP 
 
 ## Maintainer
 
-由吴煜维护，关注 AI Agent、MCP、自动化工作流与知识沉淀。
+Maintained by [@aipmer](https://github.com/aipmer), focusing on AI agents, MCP, automation workflows, and knowledge systems.
 
-- X：[@ai_pmer](https://x.com/ai_pmer)
-- Website：[pmer.cn](https://pmer.cn/)
-- GitHub：[@aipmer](https://github.com/aipmer)
+- X: [@ai_pmer](https://x.com/ai_pmer)
+- Website: [pmer.cn](https://pmer.cn/)
+- GitHub: [@aipmer](https://github.com/aipmer)
 
 ## Related project
 
-- [plugins-codex-feishu](https://github.com/aipmer/plugins-codex-feishu) — Codex 与飞书之间的值班、审批、文档和协作能力。
+- [plugins-codex-feishu](https://github.com/aipmer/plugins-codex-feishu) — Codex and Feishu workflows for on-call operations, approvals, documents, and collaboration.
 
 ## License
 
