@@ -59,7 +59,8 @@ export function safeEqual(a: string, b: string) {
 }
 
 function cleanText(value: unknown, max: number) {
-  const text = String(value ?? '').trim();
+  if (typeof value !== 'string') throw new BridgeError('invalid_text', `Text must be 1-${max} characters`);
+  const text = value.trim();
   if (!text || text.length > max) throw new BridgeError('invalid_text', `Text must be 1-${max} characters`);
   return text;
 }

@@ -7,6 +7,7 @@ import {
 } from '@cloudflare/workers-oauth-provider';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { BridgeError, MAX_TASK_ATTACHMENT_BYTES, safeEqual, validateAttachments, validateResult } from './validation';
+import { isAuthorizationCallback, validateOAuthClientRegistration } from './oauth-callbacks';
 
 export { safeEqual, validateAttachments, validateResult } from './validation';
 
@@ -31,7 +32,10 @@ const PROTOCOL_VERSION = '2025-03-26';
 const LEASE_MINUTES = 15;
 const ATTACHMENT_UPLOAD_MINUTES = 15;
 const ATTACHMENT_RETENTION_DAYS = 7;
-const OAUTH_FLOW_TTL_SECONDS = 600;
+// Consent may be completed in a separate browser window. Keep it alive for
+// 30 minutes and retain an authoritative D1 copy because KV propagation is
+// eventually consistent across Cloudflare locations.
+const OAUTH_FLOW_TTL_SECONDS = 1800;
 const GROK_OAUTH_SCOPES: Scope[] = ['task:read', 'task:claim', 'task:progress', 'task:complete'];
 const MAX_RESULT_BYTES = 500 * 1024;
 const TERMINAL = new Set<TaskStatus>(['succeeded', 'failed', 'cancelled']);
@@ -136,6 +140,10 @@ export default {
       const url = new URL(request.url);
       if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, environment: env.ENVIRONMENT });
       if (url.pathname.startsWith('/attachments/')) return handleAttachment(request, env, url);
+      if (url.pathname === '/grok-token/mcp') {
+        const auth = authenticateGrokToken(request, env);
+        return auth ? handleMcp(request, env, auth) : json({ error: 'unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer' });
+      }
       if (url.pathname === '/mcp') return handleMcp(request, env);
       return await new OAuthProvider<Env>(oauthOptionsFor(env)).fetch(request, env, ctx);
     } catch (error) {
@@ -156,17 +164,30 @@ async function handleMcp(request: Request, env: Env, suppliedAuth?: AuthContext)
     if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { Allow: 'POST' });
     const auth = suppliedAuth ?? authenticate(request, env);
     if (!auth) return json({ error: 'unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer' });
-    const body = await request.json<JSONRPCRequest>();
-    requestId = body.id;
+    const contentLength = Number(request.headers.get('content-length') ?? 0);
+    if (Number.isFinite(contentLength) && contentLength > 1024 * 1024) return json({ error: 'request_too_large' }, 413);
+    let body: JSONRPCRequest;
+    try {
+      const rawBody = await request.text();
+      if (new TextEncoder().encode(rawBody).byteLength > 1024 * 1024) return json({ error: 'request_too_large' }, 413);
+      const parsed = JSON.parse(rawBody) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return rpcError(null, -32600, 'Invalid JSON-RPC request');
+      body = parsed as JSONRPCRequest;
+    } catch {
+      return rpcError(null, -32700, 'Parse error');
+    }
+    requestId = body.id ?? null;
     if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') return rpcError(body.id, -32600, 'Invalid JSON-RPC request');
     if (body.method === 'notifications/initialized' || body.method.startsWith('notifications/')) return new Response(null, { status: 204 });
     if (body.method === 'initialize') return rpcResult(body.id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'codex-grok-task-bridge', version: '0.1.0' } });
     if (body.method === 'ping') return rpcResult(body.id, {});
     if (body.method === 'tools/list') return rpcResult(body.id, { tools: TOOL_DEFINITIONS.filter((item) => auth.scopes.has(TOOL_REQUIRED_SCOPE[item.name])) });
     if (body.method !== 'tools/call') return rpcError(body.id, -32601, 'Method not found');
-    const params = body.params as { name?: string; arguments?: Record<string, unknown> } | undefined;
+    if (body.params !== undefined && (!body.params || typeof body.params !== 'object' || Array.isArray(body.params))) return rpcError(body.id, -32602, 'Invalid params');
+    const params = body.params as { name?: unknown; arguments?: unknown } | undefined;
     if (!params?.name) return rpcError(body.id, -32602, 'Tool name is required');
-    const result = await callTool(params.name, params.arguments ?? {}, auth, env);
+    if (params.arguments !== undefined && (!params.arguments || typeof params.arguments !== 'object' || Array.isArray(params.arguments))) return rpcError(body.id, -32602, 'Tool arguments must be an object');
+    const result = await callTool(String(params.name), (params.arguments ?? {}) as Record<string, unknown>, auth, env);
     return rpcResult(body.id, { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result });
   } catch (error) {
     console.error(JSON.stringify({ error: classifyError(error) }));
@@ -188,11 +209,16 @@ async function handleOAuthAuthorization(request: Request, env: Env): Promise<Res
       return oauthErrorPage(error.description, 400);
     }
     if (authRequest.scope.length === 0) return oauthErrorPage('OAuth 客户端必须明确请求最小权限范围。', 400);
+    if (authRequest.scope.some((scope) => !GROK_OAUTH_SCOPES.includes(scope as Scope))) return oauthErrorPage('该连接器请求了不支持的权限。', 400);
+    if (!isAuthorizationCallback(authRequest.redirectUri)) return oauthErrorPage('Grok Bot 必须通过已批准的 Cursor 或 Grok 回调授权。', 400);
     const client = await oauth.lookupClient(authRequest.clientId);
     if (!client) return oauthErrorPage('无法识别 OAuth 客户端。', 400);
     const flowId = crypto.randomUUID();
     const csrf = crypto.randomUUID();
-    await env.OAUTH_KV.put(`grok-oauth-flow:${flowId}`, JSON.stringify(authRequest), { expirationTtl: OAUTH_FLOW_TTL_SECONDS });
+    const serializedRequest = JSON.stringify(authRequest);
+    const expiresAt = new Date(Date.now() + OAUTH_FLOW_TTL_SECONDS * 1000).toISOString();
+    await env.OAUTH_KV.put(`grok-oauth-flow:${flowId}`, serializedRequest, { expirationTtl: OAUTH_FLOW_TTL_SECONDS });
+    await env.DB.prepare('INSERT INTO oauth_flows (flow_id, request_json, expires_at, created_at) VALUES (?, ?, ?, ?)').bind(flowId, serializedRequest, expiresAt, new Date().toISOString()).run();
     return new Response(oauthConsentPage(client.clientName ?? 'Grok Connector', csrf, flowId, false, authRequest.scope as Scope[]), {
       headers: oauthHtmlHeaders(`__Host-GROK-OAUTH-CSRF=${csrf}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${OAUTH_FLOW_TTL_SECONDS}`),
     });
@@ -207,7 +233,9 @@ async function handleOAuthAuthorization(request: Request, env: Env): Promise<Res
   const csrfMatches = Boolean(csrf && cookieCsrf && safeEqual(csrf, cookieCsrf));
   if (!/^[0-9a-f-]{36}$/i.test(flowId) || !csrf || !cookieCsrf || !csrfMatches) return oauthErrorPage('授权会话无效或已过期，请从 Grok 连接器重新开始。', 400);
   const flowKey = `grok-oauth-flow:${flowId}`;
-  const serialized = await env.OAUTH_KV.get(flowKey);
+  // KV is fast but eventually consistent. D1 is the authoritative fallback
+  // so a quick POST from another location cannot lose the consent session.
+  const serialized = await env.OAUTH_KV.get(flowKey) ?? (await env.DB.prepare('SELECT request_json FROM oauth_flows WHERE flow_id = ? AND expires_at > ?').bind(flowId, new Date().toISOString()).first<{ request_json: string }>())?.request_json;
   if (!serialized) return oauthErrorPage('授权会话已过期，请从 Grok 连接器重新开始。', 400);
   const loginCode = String(form.get('login_code') ?? '');
   if (!env.GROK_OAUTH_LOGIN_CODE || !safeEqual(loginCode, env.GROK_OAUTH_LOGIN_CODE)) {
@@ -218,7 +246,6 @@ async function handleOAuthAuthorization(request: Request, env: Env): Promise<Res
       headers: oauthHtmlHeaders(`__Host-GROK-OAUTH-CSRF=${csrf}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${OAUTH_FLOW_TTL_SECONDS}`),
     });
   }
-  await env.OAUTH_KV.delete(flowKey);
   const authRequest = JSON.parse(serialized) as AuthRequest;
   const client = await oauth.lookupClient(authRequest.clientId);
   if (!client) return oauthErrorPage('OAuth 客户端已失效，请从 Grok 连接器重新开始。', 400);
@@ -232,25 +259,15 @@ async function handleOAuthAuthorization(request: Request, env: Env): Promise<Res
     scope: grantedScopes,
     props: { client: 'grok', scopes: grantedScopes },
   });
-  return Response.redirect(redirectTo, 302);
-}
-
-function validateOAuthClientRegistration(metadata: Record<string, unknown>) {
-  const name = typeof metadata.client_name === 'string' ? metadata.client_name : '';
-  const redirects = metadata.redirect_uris;
-  if (!/grok|x\.ai/i.test(name) || !Array.isArray(redirects) || redirects.length === 0 || redirects.length > 10) {
-    return { code: 'invalid_client_metadata', description: 'Only Grok OAuth clients with HTTPS callback URLs can register.' };
-  }
-  const allowedHosts = ['grok.com', 'x.ai', 'cursor.com', 'cursor.sh'];
-  const validRedirects = redirects.every((value) => {
-    if (typeof value !== 'string') return false;
-    try {
-      const uri = new URL(value);
-      return uri.protocol === 'https:' && !uri.username && !uri.password && allowedHosts.some((host) => uri.hostname === host || uri.hostname.endsWith(`.${host}`));
-    } catch { return false; }
-  });
-  if (!validRedirects) return { code: 'invalid_client_metadata', description: 'OAuth callbacks must use an approved Grok or xAI HTTPS domain.' };
-  return undefined;
+  await Promise.allSettled([
+    env.OAUTH_KV.delete(flowKey),
+    env.DB.prepare('DELETE FROM oauth_flows WHERE flow_id = ?').bind(flowId).run(),
+  ]);
+  // Some connector webviews submit the form successfully but do not follow a
+  // cross-origin 302 response. Show an explicit continuation page so the
+  // browser can complete the connector callback instead of leaving the user
+  // on the consent form (a second click would then report an expired flow).
+  return oauthContinuationPage(redirectTo);
 }
 
 function oauthConsentPage(clientName: string, csrf: string, flowId: string, invalidCode: boolean, scopes: Scope[]) {
@@ -260,6 +277,13 @@ function oauthConsentPage(clientName: string, csrf: string, flowId: string, inva
 
 function oauthErrorPage(message: string, status: number) {
   return new Response(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>任务桥授权失败</title><body><main><h1>无法完成授权</h1><p>${escapeHtml(message)}</p></main></body></html>`, { status, headers: oauthHtmlHeaders() });
+}
+
+function oauthContinuationPage(redirectTo: string) {
+  const safeTarget = escapeHtml(redirectTo);
+  const headers = oauthHtmlHeaders();
+  headers.set('Location', redirectTo);
+  return new Response(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="0;url=${safeTarget}"><title>正在连接 Grok</title><body><main><h1>授权成功</h1><p>正在返回 Grok Connector。若未自动跳转，请点击下方链接。</p><p><a href="${safeTarget}">继续连接 Grok</a></p></main></body></html>`, { status: 302, headers });
 }
 
 function oauthHtmlHeaders(cookie?: string) {
@@ -286,7 +310,7 @@ function scopeDescription(scope: Scope): string {
   return descriptions[scope];
 }
 
-interface JSONRPCRequest { jsonrpc?: string; id?: string | number | null; method: string; params?: unknown; }
+interface JSONRPCRequest { jsonrpc?: string; id?: string | number | null; method?: string; params?: unknown; }
 interface AuthContext { client: Client; scopes: Set<Scope>; }
 
 function authenticate(request: Request, env: Env): AuthContext | null {
@@ -298,14 +322,24 @@ function authenticate(request: Request, env: Env): AuthContext | null {
   return null;
 }
 
+// Optional static-header entry point for clients that cannot complete OAuth.
+// It accepts only the dedicated Grok token and exposes no create/cancel scope.
+function authenticateGrokToken(request: Request, env: Env): AuthContext | null {
+  const header = request.headers.get('Authorization') ?? '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  return token && safeEqual(token, env.GROK_TOKEN ?? '')
+    ? { client: 'grok', scopes: new Set(['task:read', 'task:claim', 'task:progress', 'task:complete']) }
+    : null;
+}
+
 async function callTool(name: string, args: Record<string, unknown>, auth: AuthContext, env: Env): Promise<Record<string, unknown>> {
   switch (name) {
     case 'create_task': requireScope(auth, 'task:create'); return createTask(args, auth, env);
-    case 'get_task': requireScope(auth, 'task:read'); return getTask(String(args.task_id ?? ''), auth, env);
+    case 'get_task': requireScope(auth, 'task:read'); return getTask(requireTaskId(args.task_id), auth, env);
     case 'list_tasks': requireScope(auth, 'task:read'); return listTasks(args, auth, env);
     case 'cancel_task': requireScope(auth, 'task:cancel'); return cancelTask(args, auth, env);
     case 'claim_next_task': requireScope(auth, 'task:claim'); return claimNextTask(args, env);
-    case 'renew_task_lease': requireScope(auth, 'task:progress'); return renewLease(String(args.task_id ?? ''), env);
+    case 'renew_task_lease': requireScope(auth, 'task:progress'); return renewLease(requireTaskId(args.task_id), env);
     case 'append_progress': requireScope(auth, 'task:progress'); return appendProgress(args, env);
     case 'complete_task': requireScope(auth, 'task:complete'); return completeTask(args, env);
     case 'fail_task': requireScope(auth, 'task:progress'); return failTask(args, env);
@@ -315,11 +349,10 @@ async function callTool(name: string, args: Record<string, unknown>, auth: AuthC
 }
 
 async function createTask(args: Record<string, unknown>, auth: AuthContext, env: Env) {
-  const source = String(args.source ?? '');
+  const source = typeof args.source === 'string' ? args.source : '';
   if (source !== auth.client || source !== 'codex') throw new BridgeError('forbidden', 'source does not match authenticated client');
-  const taskType = String(args.task_type ?? '');
+  const taskType = typeof args.task_type === 'string' ? args.task_type : '';
   if (taskType !== 'codex_research') throw new BridgeError('invalid_task_type', 'Codex may only create codex_research tasks');
-  if (source === 'codex' && taskType !== 'codex_research') throw new BridgeError('invalid_task_type', 'Codex may only create codex_research tasks');
   const title = cleanText(args.title, 200);
   const instructions = cleanText(args.instructions, 50000);
   const acceptance = cleanOptionalText(args.acceptance_criteria, 10000);
@@ -330,8 +363,9 @@ async function createTask(args: Record<string, unknown>, auth: AuthContext, env:
   const attachments = validateAttachments(args.attachments);
   const now = new Date().toISOString();
   const taskId = crypto.randomUUID();
-  const rawPriority = Number(args.priority ?? 50); if (!Number.isInteger(rawPriority)) throw new BridgeError('invalid_priority', 'priority must be an integer');
-  const priority = Math.max(0, Math.min(100, rawPriority));
+  const rawPriority = args.priority ?? 50;
+  if (typeof rawPriority !== 'number' || !Number.isInteger(rawPriority) || rawPriority < 0 || rawPriority > 100) throw new BridgeError('invalid_priority', 'priority must be an integer between 0 and 100');
+  const priority = rawPriority;
   const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO tasks (id, source, task_type, title, instructions, acceptance_criteria, priority, status, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`).bind(taskId, source, taskType, title, instructions, acceptance, priority, idempotencyKey, now, now), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'created', auth.client, '{}', now)];
   const responseAttachments: Record<string, unknown>[] = [];
   for (const item of attachments) {
@@ -341,7 +375,15 @@ async function createTask(args: Record<string, unknown>, auth: AuthContext, env:
     statements.push(env.DB.prepare('INSERT INTO attachments (id, task_id, name, mime_type, size_bytes, object_key, upload_status, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, \'pending\', ?, ?)').bind(id, taskId, item.name, item.mimeType, item.sizeBytes, key, expiresAt, now));
     responseAttachments.push({ id, name: item.name, mime_type: item.mimeType, size_bytes: item.sizeBytes, upload_url: await signedAttachmentUrl(env, taskId, id, 'upload', ATTACHMENT_UPLOAD_MINUTES) });
   }
-  await env.DB.batch(statements);
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    // Two first attempts with the same key can race before either sees the
+    // existing row. Treat the unique-key winner as the idempotent result.
+    const winner = await env.DB.prepare('SELECT id FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string }>();
+    if (winner) return getTask(winner.id, auth, env);
+    throw error;
+  }
   return { task_id: taskId, status: 'queued', expires_at: new Date(Date.now() + ATTACHMENT_RETENTION_DAYS * 86400000).toISOString(), attachments: responseAttachments };
 }
 
@@ -350,17 +392,24 @@ async function getTask(taskId: string, auth: AuthContext, env: Env) {
   const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(taskId).first<Record<string, unknown>>();
   if (!task) throw new BridgeError('not_found', 'Task not found');
   if (auth.client !== 'grok' && task.source !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another source');
-  if (auth.client === 'grok' && task.lease_owner !== 'grok') throw new BridgeError('forbidden', 'Task is not assigned to Grok Bot');
+  if (auth.client === 'grok' && task.lease_owner !== 'grok') {
+    const previouslyClaimed = await env.DB.prepare("SELECT 1 AS claimed FROM task_events WHERE task_id = ? AND event_type = 'claimed' AND actor = 'grok' LIMIT 1").bind(taskId).first<{ claimed: number }>();
+    if (!previouslyClaimed) throw new BridgeError('forbidden', 'Task is not assigned to Grok Bot');
+  }
   const events = await env.DB.prepare('SELECT event_type, actor, payload_json, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC').bind(taskId).all<Record<string, string>>();
   const attachments = await env.DB.prepare('SELECT id, name, mime_type, size_bytes, direction, upload_status, sha256, expires_at FROM attachments WHERE task_id = ?').bind(taskId).all<Record<string, string>>();
   const attachmentResults = await Promise.all((attachments.results ?? []).map(async (item) => ({ ...item, download_url: item.upload_status === 'uploaded' && item.expires_at > new Date().toISOString() ? await signedAttachmentUrl(env, taskId, item.id, 'download', ATTACHMENT_RETENTION_DAYS * 24 * 60) : null })));
-  return { task_id: task.id, source: task.source, task_type: task.task_type, title: task.title, status: task.status, attempts: task.attempts, created_at: task.created_at, updated_at: task.updated_at, result: parseJson(task.result_json), error: parseJson(task.error_json), events: (events.results ?? []).map((e) => ({ ...e, payload: parseJson(e.payload_json) })), attachments: attachmentResults };
+  return { task_id: task.id, source: task.source, task_type: task.task_type, title: task.title, instructions: task.instructions, acceptance_criteria: task.acceptance_criteria, priority: task.priority, status: task.status, attempts: task.attempts, lease_expires_at: task.lease_expires_at, created_at: task.created_at, updated_at: task.updated_at, completed_at: task.completed_at, result: parseJson(task.result_json), error: parseJson(task.error_json), events: (events.results ?? []).map((e) => ({ event_type: e.event_type, actor: e.actor, created_at: e.created_at, payload: parseJson(e.payload_json) })), attachments: attachmentResults };
 }
 
 async function listTasks(args: Record<string, unknown>, auth: AuthContext, env: Env) {
-  const limit = Math.max(1, Math.min(50, Number(args.limit ?? 20)));
-  const status = String(args.status ?? '');
-  const source = auth.client === 'grok' ? (args.source ? String(args.source) : '') : auth.client;
+  const rawLimit = args.limit ?? 20;
+  if (typeof rawLimit !== 'number' || !Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 50) throw new BridgeError('invalid_limit', 'limit must be an integer between 1 and 50');
+  const limit = rawLimit;
+  const status = args.status === undefined ? '' : cleanText(args.status, 20);
+  if (status && !['queued', 'claimed', 'running', 'succeeded', 'failed', 'cancelled'].includes(status)) throw new BridgeError('invalid_status', 'Unsupported task status');
+  const sourceArg = args.source === undefined ? '' : cleanText(args.source, 20);
+  const source = auth.client === 'grok' ? sourceArg : auth.client;
   const clauses = auth.client === 'grok' ? ["lease_owner = 'grok'"] : ['1 = 1']; const values: (string | number)[] = [];
   if (source) { clauses.push('source = ?'); values.push(source); }
   if (status) { clauses.push('status = ?'); values.push(status); }
@@ -369,7 +418,7 @@ async function listTasks(args: Record<string, unknown>, auth: AuthContext, env: 
 }
 
 async function cancelTask(args: Record<string, unknown>, auth: AuthContext, env: Env) {
-  const taskId = String(args.task_id ?? '');
+  const taskId = requireTaskId(args.task_id);
   const operationKey = requireIdempotencyKey(args.idempotency_key);
   const previous = await readIdempotent(env, auth.client, 'cancel_task', operationKey);
   if (previous) return previous;
@@ -383,7 +432,9 @@ async function cancelTask(args: Record<string, unknown>, auth: AuthContext, env:
     return response;
   }
   const now = new Date().toISOString();
-  await env.DB.batch([env.DB.prepare("UPDATE tasks SET status = 'cancelled', updated_at = ?, completed_at = ? WHERE id = ? AND status IN ('queued', 'claimed')").bind(now, now, taskId), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'cancelled', auth.client, '{}', now)]);
+  const cancelled = await env.DB.prepare("UPDATE tasks SET status = 'cancelled', updated_at = ?, completed_at = ? WHERE id = ? AND status IN ('queued', 'claimed')").bind(now, now, taskId).run();
+  if (!cancelled.meta.changes) throw new BridgeError('not_cancellable', 'Task changed state before cancellation');
+  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'cancelled', auth.client, '{}', now).run();
   const response = { task_id: taskId, status: 'cancelled' };
   await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response);
   return response;
@@ -393,7 +444,8 @@ async function claimNextTask(args: Record<string, unknown>, env: Env) {
   const operationKey = requireIdempotencyKey(args.idempotency_key);
   const previous = await readIdempotent(env, 'grok', 'claim_next_task', operationKey);
   if (previous) return previous;
-  const taskType = args.task_type ? String(args.task_type) : '';
+  const taskType = args.task_type === undefined ? '' : args.task_type;
+  if (typeof taskType !== 'string') throw new BridgeError('invalid_task_type', 'task_type must be a string');
   if (taskType && !['codex_research', 'research_evidence', 'browser_collection'].includes(taskType)) throw new BridgeError('invalid_task_type', 'Unsupported task type');
   const now = new Date(); const nowText = now.toISOString(); const expires = new Date(now.getTime() + LEASE_MINUTES * 60000).toISOString();
   const expired = await env.DB.prepare("SELECT id FROM tasks WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(nowText).all<{ id: string }>();
@@ -408,8 +460,12 @@ async function claimNextTask(args: Record<string, unknown>, env: Env) {
   }
   await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(claimed.id, 'claimed', 'grok', JSON.stringify({ lease_expires_at: expires }), nowText).run();
   const response = { task: await getTask(claimed.id, { client: 'grok', scopes: new Set(['task:read']) }, env) };
-  await writeIdempotent(env, 'grok', 'claim_next_task', operationKey, claimed.id, response);
-  return response;
+  const stored = await writeIdempotent(env, 'grok', 'claim_next_task', operationKey, claimed.id, response);
+  if (stored) return response;
+  // A concurrent request reused this idempotency key and won the race after
+  // both requests claimed a task. Release only our still-unstarted lease.
+  await env.DB.prepare("UPDATE tasks SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'claimed' AND lease_owner = 'grok'").bind(new Date().toISOString(), claimed.id).run();
+  return (await readIdempotent(env, 'grok', 'claim_next_task', operationKey)) ?? response;
 }
 
 async function reconcileExpired(env: Env) {
@@ -420,52 +476,65 @@ async function reconcileExpired(env: Env) {
   const attachments = await env.DB.prepare("SELECT id, object_key FROM attachments WHERE expires_at <= ? AND upload_status != 'expired' LIMIT 500").bind(now).all<{ id: string; object_key: string }>();
   if (attachments.results?.length) await env.ATTACHMENTS.delete(attachments.results.map((item) => item.object_key));
   for (const item of attachments.results ?? []) await env.DB.prepare("UPDATE attachments SET upload_status = 'expired' WHERE id = ?").bind(item.id).run();
+  await env.DB.prepare("DELETE FROM oauth_flows WHERE expires_at <= ?").bind(now).run();
   await env.DB.prepare("DELETE FROM operation_idempotency WHERE created_at <= datetime('now', '-30 days')").run();
 }
 
 async function renewLease(taskId: string, env: Env) {
   const task = await ownedTask(taskId, env, ['claimed', 'running']);
+  const now = new Date().toISOString();
   const expires = new Date(Date.now() + LEASE_MINUTES * 60000).toISOString();
-  await env.DB.prepare('UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_owner = \'grok\'').bind(expires, new Date().toISOString(), taskId).run();
+  const renewed = await env.DB.prepare("UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?").bind(expires, now, taskId, now).run();
+  if (!renewed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
   return { task_id: taskId, lease_expires_at: expires };
 }
 
 async function appendProgress(args: Record<string, unknown>, env: Env) {
-  const taskId = String(args.task_id ?? ''); const message = cleanText(args.message, 5000); await ownedTask(taskId, env, ['claimed', 'running']);
+  const taskId = requireTaskId(args.task_id); const message = cleanText(args.message, 5000); await ownedTask(taskId, env, ['claimed', 'running']);
   const now = new Date().toISOString();
-  await env.DB.batch([env.DB.prepare("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND lease_owner = 'grok'").bind(now, taskId), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'progress', 'grok', JSON.stringify({ message }), now)]);
+  const progressed = await env.DB.prepare("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?").bind(now, taskId, now).run();
+  if (!progressed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
+  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'progress', 'grok', JSON.stringify({ message }), now).run();
   return { task_id: taskId, status: 'running', message };
 }
 
 async function completeTask(args: Record<string, unknown>, env: Env) {
-  const taskId = String(args.task_id ?? ''); const operationKey = requireIdempotencyKey(args.idempotency_key);
+  const taskId = requireTaskId(args.task_id); const operationKey = requireIdempotencyKey(args.idempotency_key);
   const previous = await readIdempotent(env, 'grok', 'complete_task', operationKey); if (previous) return previous;
   await ownedTask(taskId, env, ['claimed', 'running']);
   const result = validateResult(args.result);
-  const serialized = JSON.stringify(result); if (serialized.length > MAX_RESULT_BYTES) throw new BridgeError('result_too_large', 'result exceeds 500 KB');
+  const serialized = JSON.stringify(result); if (new TextEncoder().encode(serialized).byteLength > MAX_RESULT_BYTES) throw new BridgeError('result_too_large', 'result exceeds 500 KB');
   const now = new Date().toISOString();
-  await env.DB.batch([env.DB.prepare("UPDATE tasks SET status = 'succeeded', result_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, completed_at = ? WHERE id = ? AND lease_owner = 'grok'").bind(serialized, now, now, taskId), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'completed', 'grok', serialized, now)]);
+  const completed = await env.DB.prepare("UPDATE tasks SET status = 'succeeded', result_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, completed_at = ? WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?").bind(serialized, now, now, taskId, now).run();
+  if (!completed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
+  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'completed', 'grok', serialized, now).run();
   const response = { task_id: taskId, status: 'succeeded', result };
   await writeIdempotent(env, 'grok', 'complete_task', operationKey, taskId, response);
   return response;
 }
 
 async function failTask(args: Record<string, unknown>, env: Env) {
-  const taskId = String(args.task_id ?? ''); const operationKey = requireIdempotencyKey(args.idempotency_key);
+  const taskId = requireTaskId(args.task_id); const operationKey = requireIdempotencyKey(args.idempotency_key);
   const previous = await readIdempotent(env, 'grok', 'fail_task', operationKey); if (previous) return previous;
   await ownedTask(taskId, env, ['claimed', 'running']);
-  const error = args.error && typeof args.error === 'object' ? args.error : { message: cleanText(args.error, 2000) }; const retryable = args.retryable === true;
+  const rawError = args.error;
+  const error = rawError && typeof rawError === 'object' && !Array.isArray(rawError) ? rawError : { message: cleanText(rawError, 2000) };
+  const serializedError = JSON.stringify(error);
+  if (new TextEncoder().encode(serializedError).byteLength > 10000) throw new BridgeError('invalid_error', 'error exceeds 10 KB');
+  const retryable = args.retryable === true;
   const current = await env.DB.prepare('SELECT attempts, max_attempts FROM tasks WHERE id = ?').bind(taskId).first<{ attempts: number; max_attempts: number }>();
   const shouldRetry = retryable && current && current.attempts < current.max_attempts;
   const status = shouldRetry ? 'queued' : 'failed'; const now = new Date().toISOString();
-  await env.DB.batch([env.DB.prepare(`UPDATE tasks SET status = ?, error_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?${shouldRetry ? '' : ', completed_at = ?'} WHERE id = ? AND lease_owner = 'grok'`).bind(...(shouldRetry ? [status, JSON.stringify(error), now, taskId] : [status, JSON.stringify(error), now, now, taskId])), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, status === 'queued' ? 'requeued' : 'failed', 'grok', JSON.stringify(error), now)]);
+  const failed = await env.DB.prepare(`UPDATE tasks SET status = ?, error_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?${shouldRetry ? '' : ', completed_at = ?'} WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?`).bind(...(shouldRetry ? [status, serializedError, now, taskId, now] : [status, serializedError, now, now, taskId, now])).run();
+  if (!failed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
+  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, status === 'queued' ? 'requeued' : 'failed', 'grok', serializedError, now).run();
   const response = { task_id: taskId, status };
   await writeIdempotent(env, 'grok', 'fail_task', operationKey, taskId, response);
   return response;
 }
 
 async function prepareResultAttachment(args: Record<string, unknown>, env: Env) {
-  const taskId = String(args.task_id ?? '');
+  const taskId = requireTaskId(args.task_id);
   await ownedTask(taskId, env, ['claimed', 'running']);
   const [item] = validateAttachments([{ name: args.name, mime_type: args.mime_type, size_bytes: args.size_bytes }]);
   const used = await env.DB.prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM attachments WHERE task_id = ?').bind(taskId).first<{ total: number }>();
@@ -481,6 +550,10 @@ async function ownedTask(taskId: string, env: Env, statuses: TaskStatus[]) {
   const task = await env.DB.prepare('SELECT id, status FROM tasks WHERE id = ? AND lease_owner = \'grok\'').bind(taskId).first<{ id: string; status: TaskStatus }>();
   if (!task || !statuses.includes(task.status)) throw new BridgeError('lease_not_owned', 'Task is not owned by the current Grok lease');
   return task;
+}
+
+function requireTaskId(value: unknown) {
+  return cleanText(value, 100);
 }
 
 async function handleAttachment(request: Request, env: Env, url: URL) {
@@ -514,14 +587,14 @@ async function sign(secret: string, payload: string) { const key = await crypto.
 async function verifySignature(env: Env, payload: string, signature: string) { return safeEqual(await sign(env.ATTACHMENT_SIGNING_SECRET, payload), signature); }
 function b64url(bytes: Uint8Array) { let binary = ''; bytes.forEach((b) => { binary += String.fromCharCode(b); }); return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', ''); }
 async function sha256Hex(data: ArrayBuffer) { const digest = await crypto.subtle.digest('SHA-256', data); return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join(''); }
-function cleanText(value: unknown, max: number) { const text = String(value ?? '').trim(); if (!text || text.length > max) throw new BridgeError('invalid_text', `Text must be 1-${max} characters`); return text; }
+function cleanText(value: unknown, max: number) { if (typeof value !== 'string') throw new BridgeError('invalid_text', `Text must be 1-${max} characters`); const text = value.trim(); if (!text || text.length > max) throw new BridgeError('invalid_text', `Text must be 1-${max} characters`); return text; }
 function cleanOptionalText(value: unknown, max: number) { if (value === undefined || value === null || value === '') return ''; return cleanText(value, max); }
 function requireIdempotencyKey(value: unknown) { const key = cleanText(value, 200); if (key.length < 8) throw new BridgeError('invalid_idempotency_key', 'idempotency_key must have at least 8 characters'); return key; }
 async function readIdempotent(env: Env, actor: Client, operation: string, key: string): Promise<Record<string, unknown> | null> { const row = await env.DB.prepare('SELECT response_json FROM operation_idempotency WHERE actor = ? AND operation = ? AND idempotency_key = ?').bind(actor, operation, key).first<{ response_json: string }>(); return row ? parseJson(row.response_json) as Record<string, unknown> : null; }
-async function writeIdempotent(env: Env, actor: Client, operation: string, key: string, taskId: string | null, response: Record<string, unknown>) { await env.DB.prepare('INSERT OR IGNORE INTO operation_idempotency (actor, operation, idempotency_key, task_id, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(actor, operation, key, taskId, JSON.stringify(response), new Date().toISOString()).run(); }
+async function writeIdempotent(env: Env, actor: Client, operation: string, key: string, taskId: string | null, response: Record<string, unknown>) { const result = await env.DB.prepare('INSERT OR IGNORE INTO operation_idempotency (actor, operation, idempotency_key, task_id, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(actor, operation, key, taskId, JSON.stringify(response), new Date().toISOString()).run(); return Boolean(result.meta.changes); }
 function parseJson(value: unknown) { if (typeof value !== 'string' || !value) return null; try { return JSON.parse(value); } catch { return { raw: '[unparseable]' }; } }
 function requireScope(auth: AuthContext, scope: Scope) { if (!auth.scopes.has(scope)) throw new BridgeError('forbidden', `Missing scope: ${scope}`); }
 function classifyError(error: unknown) { return error instanceof BridgeError ? error.code : 'unexpected_error'; }
-function json(value: unknown, status = 200, extra: Record<string, string> = {}) { return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json', ...extra } }); }
+function json(value: unknown, status = 200, extra: Record<string, string> = {}) { return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...extra } }); }
 function rpcResult(id: JSONRPCRequest['id'], result: unknown) { return json({ jsonrpc: '2.0', id, result }); }
 function rpcError(id: JSONRPCRequest['id'], code: number, message: string) { return json({ jsonrpc: '2.0', id, error: { code, message } }, 400); }

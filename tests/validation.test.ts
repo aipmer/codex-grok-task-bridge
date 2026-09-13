@@ -7,6 +7,7 @@ test('attachment validation enforces the declared security boundary', () => {
   assert.deepEqual(attachments, [{ name: 'brief.md', mimeType: 'text/markdown', sizeBytes: 42 }]);
   assert.throws(() => validateAttachments([{ name: '.env', mime_type: 'text/plain', size_bytes: 1 }]));
   assert.throws(() => validateAttachments([{ name: 'oversize.pdf', mime_type: 'application/pdf', size_bytes: 10 * 1024 * 1024 + 1 }]));
+  assert.throws(() => validateAttachments([{ name: { toString: () => 'brief.md' }, mime_type: 'text/markdown', size_bytes: 42 }]));
 });
 
 test('structured evidence result rejects incomplete evidence', () => {
@@ -17,6 +18,7 @@ test('structured evidence result rejects incomplete evidence', () => {
   });
   assert.equal(valid.summary, 'One source was checked.');
   assert.throws(() => validateResult({ summary: 'No source fields', evidence: [{ url: 'https://example.com' }] }));
+  assert.throws(() => validateResult({ summary: { toString: () => 'not a string' }, evidence: [] }));
 });
 
 test('constant-time comparison has deterministic equality behavior', () => {
