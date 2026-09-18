@@ -41,6 +41,8 @@ npx wrangler r2 bucket create codex-grok-task-bridge-attachments
 
 Replace the resource placeholders in `wrangler.jsonc`, then set secrets with Wrangler. Never commit `.dev.vars`, access tokens, OAuth login codes, cookies, or production data.
 
+`wrangler.jsonc` declares two cron triggers: `*/5 * * * *` reconciles expired task leases against D1, and the daily `17 3 * * *` run purges stale OAuth state. The purge stays off the five-minute schedule because its KV `list` calls would otherwise exhaust the free-plan daily limit.
+
 ```bash
 npx wrangler d1 migrations apply codex-grok-task-bridge --local
 npm run dev

@@ -42,6 +42,8 @@ npx wrangler r2 bucket create codex-grok-task-bridge-attachments
 
 替换 `wrangler.jsonc` 中的资源占位符，再使用 Wrangler 设置密钥。不要提交 `.dev.vars`、访问令牌、OAuth 登录码、Cookie 或生产数据。
 
+`wrangler.jsonc` 声明了两个定时触发：`*/5 * * * *` 通过 D1 回收过期的任务租约，每天一次的 `17 3 * * *` 清理过期 OAuth 状态。清理任务没有放在五分钟周期里，因为它的 KV `list` 调用会很快耗尽免费版每日额度。
+
 ```bash
 npx wrangler d1 migrations apply codex-grok-task-bridge --local
 npm run dev

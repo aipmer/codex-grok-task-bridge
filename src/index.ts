@@ -32,6 +32,9 @@ const PROTOCOL_VERSION = '2025-03-26';
 const LEASE_MINUTES = 15;
 const ATTACHMENT_UPLOAD_MINUTES = 15;
 const ATTACHMENT_RETENTION_DAYS = 7;
+// KV list calls are capped at 1,000/day on the free plan, so the OAuth purge
+// runs on its own daily trigger instead of every five minutes.
+const OAUTH_PURGE_CRON = '17 3 * * *';
 // Consent may be completed in a separate browser window. Keep it alive for
 // 30 minutes and retain an authoritative D1 copy because KV propagation is
 // eventually consistent across Cloudflare locations.
@@ -152,9 +155,17 @@ export default {
       return json({ error: 'internal_error' }, 500);
     }
   },
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const oauthProvider = new OAuthProvider<Env>(oauthOptionsFor(env));
-    ctx.waitUntil(Promise.all([reconcileExpired(env), oauthProvider.purgeExpiredData(env)]).then(() => undefined));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    // reconcileExpired only touches D1 and must stay frequent so expired
+    // leases requeue quickly. purgeExpiredData scans KV with list calls and
+    // the free tier allows only 1,000 lists/day, so it runs on a separate
+    // daily cron instead of every 5 minutes.
+    if (event.cron === OAUTH_PURGE_CRON) {
+      const oauthProvider = new OAuthProvider<Env>(oauthOptionsFor(env));
+      ctx.waitUntil(oauthProvider.purgeExpiredData(env).then(() => undefined));
+      return;
+    }
+    ctx.waitUntil(reconcileExpired(env).then(() => undefined));
   },
 };
 
