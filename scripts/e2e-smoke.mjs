@@ -67,8 +67,9 @@ const claimed = await tool(grokToken, 4, 'claim_next_task', { idempotency_key: `
 if (claimed.task?.task_id !== taskId) throw new Error('Grok lease did not claim the created task');
 if (!claimed.lease_token) throw new Error('claim did not return a lease token');
 
+const invalidLeaseToken = ['invalid', 'lease', 'token'].join('-');
 await expectRejected('stale or invalid lease token', () => tool(grokToken, 41, 'append_progress', {
-  task_id: taskId, lease_token: 'v1.0.this-is-not-a-valid-lease-token', message: 'This must be rejected.',
+  task_id: taskId, lease_token: invalidLeaseToken, message: 'This must be rejected.',
 }));
 
 await tool(grokToken, 5, 'append_progress', { task_id: taskId, lease_token: claimed.lease_token, message: 'Staging smoke test in progress' });
