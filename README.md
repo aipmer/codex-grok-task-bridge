@@ -4,7 +4,7 @@
 
 Open-source MCP task bridge for Codex and Grok Bot, with asynchronous jobs, fenced leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2. Codex creates a task; a connected executor claims it and returns structured results and evidence.
 
-This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.2.
+This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.3.
 
 ## How it works
 
@@ -92,6 +92,19 @@ Keep `CODEX_GROK_BRIDGE_TOKEN` in the local environment or a secret manager; nev
 - Do not expose a shared public Worker without adding rate limits, abuse controls, tenant isolation, and cost controls.
 - Report suspected vulnerabilities privately using `SECURITY.md`; do not publish credentials in Issues.
 
+## Continue the originating Codex task
+
+The optional [Grok Task Continuation skill](skills/grok-task-continuation/SKILL.md) makes the Codex side of an asynchronous hand-off explicit. After creating bridge tasks, it creates a heartbeat scoped to the current Codex task. When a known task reaches a terminal state, Codex reviews the authoritative `get_task` result, including evidence and limitations, then continues the original request using the authority already granted.
+
+Install it globally for future Codex tasks:
+
+```bash
+mkdir -p ~/.codex/skills
+cp -R skills/grok-task-continuation ~/.codex/skills/
+```
+
+This is a per-task continuation consumer, not a Worker callback. Neither the Worker nor Grok Bot can push a message into an arbitrary Codex conversation. The heartbeat remains silent while tasks are non-terminal and asks for new authority before any external write, deployment, publication, payment, or destructive action.
+
 ## Roadmap
 
 ### v0.1 — Codex × Grok Bot
@@ -107,6 +120,12 @@ Keep `CODEX_GROK_BRIDGE_TOKEN` in the local environment or a secret manager; nev
 - Read-only task types only. Browser writes, sending messages, publishing, payments, deletion, and production changes are rejected.
 - Retry uses delayed backoff and attempt records; cancellation of a running task is cooperative and visible to the executor.
 - Completion responses are replay-safe when the response is lost after the state transition.
+
+### v0.3 — Codex continuation
+
+- Optional `grok-task-continuation` Skill keeps the originating Codex task responsible for evaluating a terminal bridge result and completing the requested follow-up.
+- A per-task heartbeat polls only the task IDs created in that Codex task; it is silent while work is pending and does not scan unrelated conversations.
+- The documented flow preserves evidence and limitations, and requires fresh authority for any newly proposed external side effect.
 
 ### Later — Hermes × Grok Bot
 

@@ -4,7 +4,7 @@
 
 面向 Codex 和 Grok Bot 的开源 MCP 任务桥，提供异步任务、租约 fencing、幂等、范围化 OAuth，以及 Cloudflare Workers/D1/R2 支持。Codex 创建任务，已连接的执行端领取任务并返回结构化结果与证据。
 
-本项目不是官方 xAI SDK，也不是 Grok API 集成；不使用 CC Switch Grok OAuth、Grok 私有 API 或无鉴权回退。Hermes 集成属于后续路线，不是 v0.2 的运行依赖。
+本项目不是官方 xAI SDK，也不是 Grok API 集成；不使用 CC Switch Grok OAuth、Grok 私有 API 或无鉴权回退。Hermes 集成属于后续路线，不是 v0.3 的运行依赖。
 
 ## 工作方式
 
@@ -93,6 +93,19 @@ codex mcp add grok-bridge \
 - 未加入限流、防滥用、租户隔离和成本控制前，不要暴露共享公共 Worker。
 - 漏洞请按照 `SECURITY.md` 私下报告，不要在 Issue 中公开凭据。
 
+## 让原始 Codex 任务继续执行
+
+可选的 [Grok Task Continuation Skill](skills/grok-task-continuation/SKILL.md) 明确了异步交接后的 Codex 侧职责：创建桥接任务后，它会为当前 Codex 任务创建一个限定范围的 Heartbeat；当已知任务进入终态，Codex 读取权威的 `get_task` 结果，核对证据与限制说明，再在既有授权范围内继续完成原始请求。
+
+如需让后续 Codex 任务全局可用，可安装该 Skill：
+
+```bash
+mkdir -p ~/.codex/skills
+cp -R skills/grok-task-continuation ~/.codex/skills/
+```
+
+这不是 Worker 回调。Worker 和 Grok Bot 都不能主动向任意 Codex 对话推送消息；Heartbeat 是按原始任务创建的续跑消费者，任务未结束时保持静默。任何新的外部写入、部署、发布、付款或破坏性动作仍需取得新的授权。
+
 ## 路线图
 
 ### v0.1 — Codex × Grok Bot
@@ -108,6 +121,12 @@ codex mcp add grok-bridge \
 - 当前只允许只读任务。浏览器写入、发送消息、发布、付款、删除和生产修改一律拒绝。
 - 重试使用延迟退避并保留执行尝试记录；运行中任务采用协作式取消。
 - 完成状态已写入但响应丢失时，使用同一幂等键可安全取得原结果。
+
+### v0.3 — Codex 续跑
+
+- 可选 `grok-task-continuation` Skill 使原始 Codex 任务负责审阅终态结果并完成后续工作，而不是止步于状态通知。
+- 按任务创建的 Heartbeat 只轮询该 Codex 任务生成的 `task_id`，任务未结束时保持静默，不扫描其他对话。
+- 流程会保留证据和限制说明；任何新提出的外部副作用仍需新的授权。
 
 ### 后续 — Hermes × Grok Bot
 

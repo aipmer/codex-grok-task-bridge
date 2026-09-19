@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.0 — 2026-09-19
+
+- Added the optional `grok-task-continuation` Codex Skill for per-task continuation after a Grok bridge task reaches a terminal state.
+- Documented the scoped heartbeat pattern: poll only known task IDs, treat `get_task` as authoritative, preserve evidence and limitations, and continue the original Codex request rather than stop at a status notification.
+- Clarified the platform boundary: this client-side continuation does not make the Worker or Grok Bot capable of waking arbitrary Codex conversations.
+
 ## v0.2.0 — 2026-09-19
 
 - Added fenced lease tokens and monotonically increasing lease generations, preventing stale executors from reporting progress or submitting results after a task is reclaimed.
