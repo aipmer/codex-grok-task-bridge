@@ -2,9 +2,9 @@
 
 [Chinese README](README.zh-CN.md)
 
-Open-source MCP task bridge for Codex and Grok Bot, with asynchronous jobs, leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2. Codex creates a task; a connected executor claims it and returns structured results and evidence.
+Open-source MCP task bridge for Codex and Grok Bot, with asynchronous jobs, fenced leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2. Codex creates a task; a connected executor claims it and returns structured results and evidence.
 
-This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.1.
+This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.2.
 
 ## How it works
 
@@ -20,7 +20,7 @@ The target unattended setup uses a Grok Bot Routine to call `claim_next_task` on
 
 ## Current status
 
-- v0.1 implements Codex task creation and the Grok-facing claim/progress/result protocol. The live smoke test so far used a manually prompted grok.com conversation; unattended Grok Bot execution has not yet been verified.
+- v0.2 adds fenced lease tokens, attempt history, delayed retries, cancellation requests, and replay-safe completion responses. The live smoke test so far used a manually prompted grok.com conversation; unattended Grok Bot execution has not yet been verified.
 - Grok is limited to read, claim, progress, lease renewal, and result submission.
 - No public shared Worker instance is provided. Deploy your own Cloudflare resources.
 - The code has been validated with Cloudflare Worker, D1, R2, and OAuth 2.1 + PKCE.
@@ -89,7 +89,14 @@ The connector is invoked by a conversation or a scheduled Routine. A Custom MCP 
 - Results include structured evidence, limitations, and artifacts.
 - Cloudflare Worker, D1, R2, and OAuth provide the transport and state layer.
 
-### v0.2 — Hermes × Grok Bot
+### v0.2 — Execution safety
+
+- Each claim receives an opaque lease token and generation; stale executors cannot renew, report progress, upload result attachments, fail, or complete a reclaimed task.
+- Read-only task types only. Browser writes, sending messages, publishing, payments, deletion, and production changes are rejected.
+- Retry uses delayed backoff and attempt records; cancellation of a running task is cooperative and visible to the executor.
+- Completion responses are replay-safe when the response is lost after the state transition.
+
+### Later — Hermes × Grok Bot
 
 - Hermes keeps `hermes kanban` as its task source of truth.
 - A separate adapter will submit only `research_evidence` and `browser_collection` tasks.

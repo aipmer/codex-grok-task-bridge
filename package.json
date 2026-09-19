@@ -1,6 +1,6 @@
 {
   "name": "codex-grok-task-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",

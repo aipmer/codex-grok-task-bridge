@@ -2,9 +2,9 @@
 
 [English README](README.md)
 
-面向 Codex 和 Grok Bot 的开源 MCP 任务桥，提供异步任务、租约、幂等、范围化 OAuth，以及 Cloudflare Workers/D1/R2 支持。Codex 创建任务，已连接的执行端领取任务并返回结构化结果与证据。
+面向 Codex 和 Grok Bot 的开源 MCP 任务桥，提供异步任务、租约 fencing、幂等、范围化 OAuth，以及 Cloudflare Workers/D1/R2 支持。Codex 创建任务，已连接的执行端领取任务并返回结构化结果与证据。
 
-本项目不是官方 xAI SDK，也不是 Grok API 集成；不使用 CC Switch Grok OAuth、Grok 私有 API 或无鉴权回退。Hermes 集成属于后续路线，不是 v0.1 的运行依赖。
+本项目不是官方 xAI SDK，也不是 Grok API 集成；不使用 CC Switch Grok OAuth、Grok 私有 API 或无鉴权回退。Hermes 集成属于后续路线，不是 v0.2 的运行依赖。
 
 ## 工作方式
 
@@ -20,7 +20,7 @@ Codex ── Bearer MCP ──> Cloudflare Task Bridge <── OAuth MCP ── 
 
 ## 当前状态
 
-- v0.1 已实现 Codex 创建任务，以及 Grok 侧领取、进度、租约和结果回传协议。
+- v0.2 增加租约令牌与代次 fencing、执行尝试记录、受控延迟重试、取消请求和可重放的完成响应。
 - 已完成一次公开 X 账号只读调研案例；该案例通过手动触发的 Grok Bot 对话验证，不代表 Routine 无人值守触发能力已完成验收。
 - Grok 仅拥有读取、领取、更新进度、续租和提交结果的权限。
 - 不提供公共共享 Worker 实例；请部署自己的 Cloudflare 资源。
@@ -90,7 +90,14 @@ task:read task:claim task:progress task:complete
 - 结果包含结构化证据、限制说明和产物；
 - Cloudflare Worker、D1、R2 和 OAuth 提供传输与状态层。
 
-### v0.2 — Hermes × Grok Bot
+### v0.2 — 执行安全
+
+- 每次领取都会获得一次性租约令牌和递增代次。过期或已被接管的执行者不能续租、更新进度、上传结果附件、失败或完成任务。
+- 当前只允许只读任务。浏览器写入、发送消息、发布、付款、删除和生产修改一律拒绝。
+- 重试使用延迟退避并保留执行尝试记录；运行中任务采用协作式取消。
+- 完成状态已写入但响应丢失时，使用同一幂等键可安全取得原结果。
+
+### 后续 — Hermes × Grok Bot
 
 - Hermes 继续使用 `hermes kanban` 作为任务真源；
 - 适配器只投递 `research_evidence` 和 `browser_collection` 任务；

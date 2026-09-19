@@ -28,6 +28,13 @@ type Scope = 'task:create' | 'task:read' | 'task:cancel' | 'task:claim' | 'task:
 type TaskStatus = 'queued' | 'claimed' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 type AttachmentDirection = 'input' | 'result';
 
+const TASK_CAPABILITIES = {
+  codex_research: { effectClass: 'read_only' },
+  research_evidence: { effectClass: 'read_only' },
+  browser_collection: { effectClass: 'read_only' },
+} as const;
+type TaskType = keyof typeof TASK_CAPABILITIES;
+
 const PROTOCOL_VERSION = '2025-03-26';
 const LEASE_MINUTES = 15;
 const ATTACHMENT_UPLOAD_MINUTES = 15;
@@ -41,6 +48,9 @@ const OAUTH_PURGE_CRON = '17 3 * * *';
 const OAUTH_FLOW_TTL_SECONDS = 1800;
 const GROK_OAUTH_SCOPES: Scope[] = ['task:read', 'task:claim', 'task:progress', 'task:complete'];
 const MAX_RESULT_BYTES = 500 * 1024;
+const MAX_TASK_EVENTS = 200;
+const EXECUTION_DEADLINE_MINUTES = 45;
+const MAX_RETRY_DELAY_MINUTES = 60;
 const TERMINAL = new Set<TaskStatus>(['succeeded', 'failed', 'cancelled']);
 
 const TOOL_DEFINITIONS = [
@@ -72,19 +82,19 @@ const TOOL_DEFINITIONS = [
     type: 'object', required: ['idempotency_key'], properties: { task_type: { type: 'string' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
   }),
   tool('renew_task_lease', 'Renew the current Grok Bot task lease.', {
-    type: 'object', required: ['task_id'], properties: { task_id: { type: 'string' } },
+    type: 'object', required: ['task_id', 'lease_token'], properties: { task_id: { type: 'string' }, lease_token: { type: 'string', minLength: 20, maxLength: 200 } },
   }),
   tool('append_progress', 'Append progress to a claimed Grok Bot task.', {
-    type: 'object', required: ['task_id', 'message'], properties: { task_id: { type: 'string' }, message: { type: 'string', maxLength: 5000 } },
+    type: 'object', required: ['task_id', 'lease_token', 'message'], properties: { task_id: { type: 'string' }, lease_token: { type: 'string', minLength: 20, maxLength: 200 }, message: { type: 'string', maxLength: 5000 } },
   }),
   tool('complete_task', 'Complete a Grok Bot task with a structured evidence result.', {
-    type: 'object', required: ['task_id', 'result', 'idempotency_key'], properties: { task_id: { type: 'string' }, result: { type: 'object' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
+    type: 'object', required: ['task_id', 'lease_token', 'result', 'idempotency_key'], properties: { task_id: { type: 'string' }, lease_token: { type: 'string', minLength: 20, maxLength: 200 }, result: { type: 'object' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
   }),
   tool('fail_task', 'Fail or requeue a Grok Bot task.', {
-    type: 'object', required: ['task_id', 'error', 'idempotency_key'], properties: { task_id: { type: 'string' }, error: { type: 'object' }, retryable: { type: 'boolean' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
+    type: 'object', required: ['task_id', 'lease_token', 'error', 'idempotency_key'], properties: { task_id: { type: 'string' }, lease_token: { type: 'string', minLength: 20, maxLength: 200 }, error: { type: 'object' }, retryable: { type: 'boolean' }, idempotency_key: { type: 'string', minLength: 8, maxLength: 200 } },
   }),
   tool('prepare_result_attachment', 'Reserve a small result attachment slot and return a signed upload URL.', {
-    type: 'object', required: ['task_id', 'name', 'mime_type', 'size_bytes'], properties: { task_id: { type: 'string' }, name: { type: 'string' }, mime_type: { type: 'string' }, size_bytes: { type: 'integer' } },
+    type: 'object', required: ['task_id', 'lease_token', 'name', 'mime_type', 'size_bytes'], properties: { task_id: { type: 'string' }, lease_token: { type: 'string', minLength: 20, maxLength: 200 }, name: { type: 'string' }, mime_type: { type: 'string' }, size_bytes: { type: 'integer' } },
   }),
 ];
 
@@ -190,7 +200,7 @@ async function handleMcp(request: Request, env: Env, suppliedAuth?: AuthContext)
     requestId = body.id ?? null;
     if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') return rpcError(body.id, -32600, 'Invalid JSON-RPC request');
     if (body.method === 'notifications/initialized' || body.method.startsWith('notifications/')) return new Response(null, { status: 204 });
-    if (body.method === 'initialize') return rpcResult(body.id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'codex-grok-task-bridge', version: '0.1.0' } });
+    if (body.method === 'initialize') return rpcResult(body.id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'codex-grok-task-bridge', version: '0.2.0' } });
     if (body.method === 'ping') return rpcResult(body.id, {});
     if (body.method === 'tools/list') return rpcResult(body.id, { tools: TOOL_DEFINITIONS.filter((item) => auth.scopes.has(TOOL_REQUIRED_SCOPE[item.name])) });
     if (body.method !== 'tools/call') return rpcError(body.id, -32601, 'Method not found');
@@ -350,7 +360,7 @@ async function callTool(name: string, args: Record<string, unknown>, auth: AuthC
     case 'list_tasks': requireScope(auth, 'task:read'); return listTasks(args, auth, env);
     case 'cancel_task': requireScope(auth, 'task:cancel'); return cancelTask(args, auth, env);
     case 'claim_next_task': requireScope(auth, 'task:claim'); return claimNextTask(args, env);
-    case 'renew_task_lease': requireScope(auth, 'task:progress'); return renewLease(requireTaskId(args.task_id), env);
+    case 'renew_task_lease': requireScope(auth, 'task:progress'); return renewLease(requireTaskId(args.task_id), requireLeaseToken(args.lease_token), env);
     case 'append_progress': requireScope(auth, 'task:progress'); return appendProgress(args, env);
     case 'complete_task': requireScope(auth, 'task:complete'); return completeTask(args, env);
     case 'fail_task': requireScope(auth, 'task:progress'); return failTask(args, env);
@@ -363,21 +373,25 @@ async function createTask(args: Record<string, unknown>, auth: AuthContext, env:
   const source = typeof args.source === 'string' ? args.source : '';
   if (source !== auth.client || source !== 'codex') throw new BridgeError('forbidden', 'source does not match authenticated client');
   const taskType = typeof args.task_type === 'string' ? args.task_type : '';
-  if (taskType !== 'codex_research') throw new BridgeError('invalid_task_type', 'Codex may only create codex_research tasks');
+  if (taskType !== 'codex_research' || !isReadOnlyTaskType(taskType)) throw new BridgeError('invalid_task_type', 'Codex may only create registered read_only tasks');
   const title = cleanText(args.title, 200);
   const instructions = cleanText(args.instructions, 50000);
   const acceptance = cleanOptionalText(args.acceptance_criteria, 10000);
   const idempotencyKey = cleanText(args.idempotency_key, 200);
   if (idempotencyKey.length < 8) throw new BridgeError('invalid_idempotency_key', 'idempotency_key must have at least 8 characters');
-  const existing = await env.DB.prepare('SELECT id FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string }>();
-  if (existing) return getTask(existing.id, auth, env);
   const attachments = validateAttachments(args.attachments);
+  const requestHash = await requestHashFor(args);
+  const existing = await env.DB.prepare('SELECT id, create_request_hash FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string; create_request_hash: string }>();
+  if (existing) {
+    if (existing.create_request_hash && !safeEqual(existing.create_request_hash, requestHash)) throw new BridgeError('idempotency_conflict', 'idempotency_key was already used with different task content');
+    return getTask(existing.id, auth, env);
+  }
   const now = new Date().toISOString();
   const taskId = crypto.randomUUID();
   const rawPriority = args.priority ?? 50;
   if (typeof rawPriority !== 'number' || !Number.isInteger(rawPriority) || rawPriority < 0 || rawPriority > 100) throw new BridgeError('invalid_priority', 'priority must be an integer between 0 and 100');
   const priority = rawPriority;
-  const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO tasks (id, source, task_type, title, instructions, acceptance_criteria, priority, status, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`).bind(taskId, source, taskType, title, instructions, acceptance, priority, idempotencyKey, now, now), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'created', auth.client, '{}', now)];
+  const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO tasks (id, source, task_type, title, instructions, acceptance_criteria, priority, status, effect_class, idempotency_key, create_request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 'read_only', ?, ?, ?, ?)`).bind(taskId, source, taskType, title, instructions, acceptance, priority, idempotencyKey, requestHash, now, now), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'created', auth.client, '{}', now)];
   const responseAttachments: Record<string, unknown>[] = [];
   for (const item of attachments) {
     const id = crypto.randomUUID();
@@ -391,8 +405,11 @@ async function createTask(args: Record<string, unknown>, auth: AuthContext, env:
   } catch (error) {
     // Two first attempts with the same key can race before either sees the
     // existing row. Treat the unique-key winner as the idempotent result.
-    const winner = await env.DB.prepare('SELECT id FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string }>();
-    if (winner) return getTask(winner.id, auth, env);
+    const winner = await env.DB.prepare('SELECT id, create_request_hash FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string; create_request_hash: string }>();
+    if (winner) {
+      if (winner.create_request_hash && !safeEqual(winner.create_request_hash, requestHash)) throw new BridgeError('idempotency_conflict', 'idempotency_key was already used with different task content');
+      return getTask(winner.id, auth, env);
+    }
     throw error;
   }
   return { task_id: taskId, status: 'queued', expires_at: new Date(Date.now() + ATTACHMENT_RETENTION_DAYS * 86400000).toISOString(), attachments: responseAttachments };
@@ -408,9 +425,10 @@ async function getTask(taskId: string, auth: AuthContext, env: Env) {
     if (!previouslyClaimed) throw new BridgeError('forbidden', 'Task is not assigned to Grok Bot');
   }
   const events = await env.DB.prepare('SELECT event_type, actor, payload_json, created_at FROM task_events WHERE task_id = ? ORDER BY id ASC').bind(taskId).all<Record<string, string>>();
+  const attempts = await env.DB.prepare('SELECT id, lease_generation, executor, started_at, ended_at, end_reason, summary_json FROM execution_attempts WHERE task_id = ? ORDER BY lease_generation ASC').bind(taskId).all<Record<string, string>>();
   const attachments = await env.DB.prepare('SELECT id, name, mime_type, size_bytes, direction, upload_status, sha256, expires_at FROM attachments WHERE task_id = ?').bind(taskId).all<Record<string, string>>();
   const attachmentResults = await Promise.all((attachments.results ?? []).map(async (item) => ({ ...item, download_url: item.upload_status === 'uploaded' && item.expires_at > new Date().toISOString() ? await signedAttachmentUrl(env, taskId, item.id, 'download', ATTACHMENT_RETENTION_DAYS * 24 * 60) : null })));
-  return { task_id: task.id, source: task.source, task_type: task.task_type, title: task.title, instructions: task.instructions, acceptance_criteria: task.acceptance_criteria, priority: task.priority, status: task.status, attempts: task.attempts, lease_expires_at: task.lease_expires_at, created_at: task.created_at, updated_at: task.updated_at, completed_at: task.completed_at, result: parseJson(task.result_json), error: parseJson(task.error_json), events: (events.results ?? []).map((e) => ({ event_type: e.event_type, actor: e.actor, created_at: e.created_at, payload: parseJson(e.payload_json) })), attachments: attachmentResults };
+  return { task_id: task.id, source: task.source, task_type: task.task_type, effect_class: task.effect_class, title: task.title, instructions: task.instructions, acceptance_criteria: task.acceptance_criteria, priority: task.priority, status: task.status, attempts: task.attempts, lease_generation: task.lease_generation, lease_expires_at: task.lease_expires_at, execution_deadline_at: task.execution_deadline_at, next_attempt_at: task.next_attempt_at, cancel_requested: Boolean(task.cancel_requested_at), created_at: task.created_at, updated_at: task.updated_at, completed_at: task.completed_at, result: parseJson(task.result_json), error: parseJson(task.error_json), events: (events.results ?? []).map((e) => ({ event_type: e.event_type, actor: e.actor, created_at: e.created_at, payload: parseJson(e.payload_json) })), execution_attempts: (attempts.results ?? []).map((attempt) => ({ attempt_id: attempt.id, lease_generation: attempt.lease_generation, executor: attempt.executor, started_at: attempt.started_at, ended_at: attempt.ended_at, end_reason: attempt.end_reason, summary: parseJson(attempt.summary_json) })), attachments: attachmentResults };
 }
 
 async function listTasks(args: Record<string, unknown>, auth: AuthContext, env: Env) {
@@ -431,59 +449,81 @@ async function listTasks(args: Record<string, unknown>, auth: AuthContext, env: 
 async function cancelTask(args: Record<string, unknown>, auth: AuthContext, env: Env) {
   const taskId = requireTaskId(args.task_id);
   const operationKey = requireIdempotencyKey(args.idempotency_key);
-  const previous = await readIdempotent(env, auth.client, 'cancel_task', operationKey);
+  const previous = await readIdempotent(env, auth.client, 'cancel_task', operationKey, args);
   if (previous) return previous;
   const task = await env.DB.prepare('SELECT status, source FROM tasks WHERE id = ?').bind(taskId).first<{ status: TaskStatus; source: Client }>();
   if (!task) throw new BridgeError('not_found', 'Task not found');
   if (task.source !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another source');
-  if (task.status === 'running') throw new BridgeError('external_work_started', 'Running tasks cannot be cancelled after execution starts');
+  if (task.status === 'running') {
+    const now = new Date().toISOString();
+    const requested = await env.DB.prepare("UPDATE tasks SET cancel_requested_at = COALESCE(cancel_requested_at, ?), cancel_requested_by = COALESCE(cancel_requested_by, ?), updated_at = ? WHERE id = ? AND status = 'running'").bind(now, auth.client, now, taskId).run();
+    if (!requested.meta.changes) throw new BridgeError('not_cancellable', 'Task changed state before cancellation');
+    await appendEvent(env, taskId, 'cancel_requested', auth.client, {}, now);
+    const response = { task_id: taskId, status: 'cancel_requested' };
+    await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response, args);
+    return response;
+  }
   if (TERMINAL.has(task.status)) {
     const response = { task_id: taskId, status: task.status };
-    await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response);
+    await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response, args);
     return response;
   }
   const now = new Date().toISOString();
   const cancelled = await env.DB.prepare("UPDATE tasks SET status = 'cancelled', updated_at = ?, completed_at = ? WHERE id = ? AND status IN ('queued', 'claimed')").bind(now, now, taskId).run();
   if (!cancelled.meta.changes) throw new BridgeError('not_cancellable', 'Task changed state before cancellation');
-  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'cancelled', auth.client, '{}', now).run();
+  await appendEvent(env, taskId, 'cancelled', auth.client, {}, now);
   const response = { task_id: taskId, status: 'cancelled' };
-  await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response);
+  await writeIdempotent(env, auth.client, 'cancel_task', operationKey, taskId, response, args);
   return response;
 }
 
 async function claimNextTask(args: Record<string, unknown>, env: Env) {
   const operationKey = requireIdempotencyKey(args.idempotency_key);
-  const previous = await readIdempotent(env, 'grok', 'claim_next_task', operationKey);
-  if (previous) return previous;
   const taskType = args.task_type === undefined ? '' : args.task_type;
-  if (typeof taskType !== 'string') throw new BridgeError('invalid_task_type', 'task_type must be a string');
-  if (taskType && !['codex_research', 'research_evidence', 'browser_collection'].includes(taskType)) throw new BridgeError('invalid_task_type', 'Unsupported task type');
-  const now = new Date(); const nowText = now.toISOString(); const expires = new Date(now.getTime() + LEASE_MINUTES * 60000).toISOString();
-  const expired = await env.DB.prepare("SELECT id FROM tasks WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(nowText).all<{ id: string }>();
-  await env.DB.prepare("UPDATE tasks SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(nowText, nowText).run();
-  if ((expired.results ?? []).length) await env.DB.batch((expired.results ?? []).map((expiredTask) => env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(expiredTask.id, 'lease_expired_requeued', 'system', '{}', nowText)));
-  const query = taskType ? `UPDATE tasks SET status = 'claimed', lease_owner = 'grok', lease_expires_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = (SELECT id FROM tasks WHERE status = 'queued' AND task_type = ? AND attempts < max_attempts ORDER BY priority DESC, created_at ASC LIMIT 1) AND status = 'queued' RETURNING id` : `UPDATE tasks SET status = 'claimed', lease_owner = 'grok', lease_expires_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = (SELECT id FROM tasks WHERE status = 'queued' AND attempts < max_attempts ORDER BY priority DESC, created_at ASC LIMIT 1) AND status = 'queued' RETURNING id`;
-  const claimed = taskType ? await env.DB.prepare(query).bind(expires, nowText, taskType).first<{ id: string }>() : await env.DB.prepare(query).bind(expires, nowText).first<{ id: string }>();
-  if (!claimed) {
-    const response = { task: null };
-    await writeIdempotent(env, 'grok', 'claim_next_task', operationKey, null, response);
-    return response;
+  if (typeof taskType !== 'string' || (taskType && !isReadOnlyTaskType(taskType))) throw new BridgeError('invalid_task_type', 'Unsupported or non-read-only task type');
+  const requestHash = await requestHashFor(args);
+  const now = new Date(); const nowText = now.toISOString();
+  await reconcileExpired(env);
+  const previous = await env.DB.prepare("SELECT t.id, t.status, t.lease_generation, t.lease_claim_key, t.lease_expires_at, a.request_hash FROM execution_attempts a JOIN tasks t ON t.id = a.task_id WHERE a.executor = 'grok' AND a.claim_idempotency_key = ?").bind(operationKey).first<{ id: string; status: TaskStatus; lease_generation: number; lease_claim_key: string; lease_expires_at: string; request_hash: string }>();
+  if (previous) {
+    if (previous.request_hash && !safeEqual(previous.request_hash, requestHash)) throw new BridgeError('idempotency_conflict', 'idempotency_key was already used with different claim content');
+    const task = await getTask(previous.id, { client: 'grok', scopes: new Set(['task:read']) }, env);
+    const active = ['claimed', 'running'].includes(previous.status) && previous.lease_claim_key === operationKey && previous.lease_expires_at > nowText;
+    return { task, lease_token: active ? await makeLeaseToken(env, previous.id, previous.lease_generation, operationKey) : null };
   }
-  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(claimed.id, 'claimed', 'grok', JSON.stringify({ lease_expires_at: expires }), nowText).run();
-  const response = { task: await getTask(claimed.id, { client: 'grok', scopes: new Set(['task:read']) }, env) };
-  const stored = await writeIdempotent(env, 'grok', 'claim_next_task', operationKey, claimed.id, response);
-  if (stored) return response;
-  // A concurrent request reused this idempotency key and won the race after
-  // both requests claimed a task. Release only our still-unstarted lease.
-  await env.DB.prepare("UPDATE tasks SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'claimed' AND lease_owner = 'grok'").bind(new Date().toISOString(), claimed.id).run();
-  return (await readIdempotent(env, 'grok', 'claim_next_task', operationKey)) ?? response;
+  const expires = new Date(now.getTime() + LEASE_MINUTES * 60000).toISOString();
+  const deadline = new Date(now.getTime() + EXECUTION_DEADLINE_MINUTES * 60000).toISOString();
+  const attemptId = crypto.randomUUID();
+  const provisionalToken = await makeLeaseToken(env, 'pending', 0, `${operationKey}:${attemptId}`);
+  const tokenHash = await sha256Text(provisionalToken);
+  const query = taskType
+    ? `UPDATE tasks SET status = 'claimed', lease_owner = 'grok', lease_expires_at = ?, execution_deadline_at = ?, lease_generation = lease_generation + 1, lease_token_hash = ?, lease_claim_key = ?, lease_attempt_id = ?, attempts = attempts + 1, updated_at = ? WHERE id = (SELECT id FROM tasks WHERE status = 'queued' AND task_type = ? AND effect_class = 'read_only' AND attempts < max_attempts AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at ASC LIMIT 1) AND status = 'queued' RETURNING id, lease_generation`
+    : `UPDATE tasks SET status = 'claimed', lease_owner = 'grok', lease_expires_at = ?, execution_deadline_at = ?, lease_generation = lease_generation + 1, lease_token_hash = ?, lease_claim_key = ?, lease_attempt_id = ?, attempts = attempts + 1, updated_at = ? WHERE id = (SELECT id FROM tasks WHERE status = 'queued' AND effect_class = 'read_only' AND attempts < max_attempts AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY priority DESC, created_at ASC LIMIT 1) AND status = 'queued' RETURNING id, lease_generation`;
+  const claimed = taskType ? await env.DB.prepare(query).bind(expires, deadline, tokenHash, operationKey, attemptId, nowText, taskType, nowText).first<{ id: string; lease_generation: number }>() : await env.DB.prepare(query).bind(expires, deadline, tokenHash, operationKey, attemptId, nowText, nowText).first<{ id: string; lease_generation: number }>();
+  if (!claimed) return { task: null, lease_token: null };
+  const leaseToken = await makeLeaseToken(env, claimed.id, claimed.lease_generation, operationKey);
+  await env.DB.batch([
+    env.DB.prepare('UPDATE tasks SET lease_token_hash = ? WHERE id = ? AND lease_generation = ?').bind(await sha256Text(leaseToken), claimed.id, claimed.lease_generation),
+    env.DB.prepare('INSERT INTO execution_attempts (id, task_id, lease_generation, executor, claim_idempotency_key, request_hash, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(attemptId, claimed.id, claimed.lease_generation, 'grok', operationKey, requestHash, nowText),
+    env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(claimed.id, 'claimed', 'grok', JSON.stringify({ attempt_id: attemptId, lease_generation: claimed.lease_generation, lease_expires_at: expires, execution_deadline_at: deadline }), nowText),
+  ]);
+  return { task: await getTask(claimed.id, { client: 'grok', scopes: new Set(['task:read']) }, env), lease_token: leaseToken };
 }
 
 async function reconcileExpired(env: Env) {
   const now = new Date().toISOString();
-  const expired = await env.DB.prepare("SELECT id FROM tasks WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(now).all<{ id: string }>();
-  await env.DB.prepare("UPDATE tasks SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(now, now).run();
-  for (const item of expired.results ?? []) await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(item.id, 'lease_expired_requeued', 'system', '{}', now).run();
+  const expired = await env.DB.prepare("SELECT id, attempts, max_attempts, lease_generation, lease_attempt_id, cancel_requested_at FROM tasks WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?").bind(now).all<{ id: string; attempts: number; max_attempts: number; lease_generation: number; lease_attempt_id: string | null; cancel_requested_at: string | null }>();
+  for (const task of expired.results ?? []) {
+    const cancelled = Boolean(task.cancel_requested_at); const exhausted = !cancelled && task.attempts >= task.max_attempts;
+    const nextAttemptAt = cancelled || exhausted ? null : new Date(Date.now() + retryDelayMinutes(task.attempts) * 60000).toISOString();
+    const nextStatus = cancelled ? 'cancelled' : exhausted ? 'failed' : 'queued';
+    const reason = cancelled ? 'cancelled' : exhausted ? 'retry_exhausted' : 'lease_expired';
+    const error = cancelled ? { code: 'cancelled', message: 'Cancellation was requested before the executor acknowledged it.' } : exhausted ? { code: 'retry_exhausted', message: 'Lease expired after the final permitted attempt.' } : { code: 'lease_expired', message: 'Lease expired; retry is delayed.' };
+    const updated = await env.DB.prepare(`UPDATE tasks SET status = ?, lease_owner = NULL, lease_expires_at = NULL, lease_token_hash = NULL, lease_claim_key = NULL, lease_attempt_id = NULL, execution_deadline_at = NULL, next_attempt_at = ?, error_json = ?, updated_at = ?, completed_at = CASE WHEN ? THEN ? ELSE completed_at END WHERE id = ? AND lease_generation = ? AND status IN ('claimed', 'running') AND lease_expires_at <= ?`).bind(nextStatus, nextAttemptAt, JSON.stringify(error), now, cancelled || exhausted ? 1 : 0, now, task.id, task.lease_generation, now).run();
+    if (!updated.meta.changes) continue;
+    if (task.lease_attempt_id) await env.DB.prepare('UPDATE execution_attempts SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL').bind(now, reason, task.lease_attempt_id).run();
+    await appendEvent(env, task.id, cancelled ? 'cancelled' : exhausted ? 'retry_exhausted' : 'lease_expired_requeued', 'system', { next_attempt_at: nextAttemptAt, lease_generation: task.lease_generation }, now);
+  }
   const attachments = await env.DB.prepare("SELECT id, object_key FROM attachments WHERE expires_at <= ? AND upload_status != 'expired' LIMIT 500").bind(now).all<{ id: string; object_key: string }>();
   if (attachments.results?.length) await env.ATTACHMENTS.delete(attachments.results.map((item) => item.object_key));
   for (const item of attachments.results ?? []) await env.DB.prepare("UPDATE attachments SET upload_status = 'expired' WHERE id = ?").bind(item.id).run();
@@ -491,62 +531,68 @@ async function reconcileExpired(env: Env) {
   await env.DB.prepare("DELETE FROM operation_idempotency WHERE created_at <= datetime('now', '-30 days')").run();
 }
 
-async function renewLease(taskId: string, env: Env) {
-  const task = await ownedTask(taskId, env, ['claimed', 'running']);
-  const now = new Date().toISOString();
-  const expires = new Date(Date.now() + LEASE_MINUTES * 60000).toISOString();
-  const renewed = await env.DB.prepare("UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?").bind(expires, now, taskId, now).run();
-  if (!renewed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
-  return { task_id: taskId, lease_expires_at: expires };
+async function renewLease(taskId: string, leaseToken: string, env: Env) {
+  const task = await ownedTask(taskId, leaseToken, env, ['claimed', 'running']);
+  const now = new Date(); const nowText = now.toISOString();
+  const expires = new Date(Math.min(now.getTime() + LEASE_MINUTES * 60000, Date.parse(task.execution_deadline_at))).toISOString();
+  if (expires <= nowText) throw new BridgeError('execution_deadline_exceeded', 'Task execution deadline has elapsed');
+  const renewed = await env.DB.prepare("UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_generation = ? AND lease_token_hash = ? AND cancel_requested_at IS NULL AND lease_expires_at > ? AND execution_deadline_at > ?").bind(expires, nowText, taskId, task.lease_generation, task.lease_token_hash, nowText, nowText).run();
+  if (!renewed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired or was cancelled');
+  return { task_id: taskId, lease_expires_at: expires, execution_deadline_at: task.execution_deadline_at };
 }
 
 async function appendProgress(args: Record<string, unknown>, env: Env) {
-  const taskId = requireTaskId(args.task_id); const message = cleanText(args.message, 5000); await ownedTask(taskId, env, ['claimed', 'running']);
+  const taskId = requireTaskId(args.task_id); const leaseToken = requireLeaseToken(args.lease_token); const message = cleanText(args.message, 5000); const task = await ownedTask(taskId, leaseToken, env, ['claimed', 'running']);
   const now = new Date().toISOString();
-  const progressed = await env.DB.prepare("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?").bind(now, taskId, now).run();
-  if (!progressed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
-  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'progress', 'grok', JSON.stringify({ message }), now).run();
+  const progressed = await env.DB.prepare("UPDATE tasks SET status = 'running', updated_at = ? WHERE id = ? AND lease_generation = ? AND lease_token_hash = ? AND cancel_requested_at IS NULL AND status IN ('claimed', 'running') AND lease_expires_at > ? AND execution_deadline_at > ?").bind(now, taskId, task.lease_generation, task.lease_token_hash, now, now).run();
+  if (!progressed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired, was cancelled, or exceeded its deadline');
+  await appendEvent(env, taskId, 'progress', 'grok', { message, attempt_id: task.lease_attempt_id }, now);
   return { task_id: taskId, status: 'running', message };
 }
 
 async function completeTask(args: Record<string, unknown>, env: Env) {
-  const taskId = requireTaskId(args.task_id); const operationKey = requireIdempotencyKey(args.idempotency_key);
-  const previous = await readIdempotent(env, 'grok', 'complete_task', operationKey); if (previous) return previous;
-  await ownedTask(taskId, env, ['claimed', 'running']);
+  const taskId = requireTaskId(args.task_id); const leaseToken = requireLeaseToken(args.lease_token); const operationKey = requireIdempotencyKey(args.idempotency_key); const requestHash = await requestHashFor(args);
+  const previous = await readIdempotent(env, 'grok', 'complete_task', operationKey, args); if (previous) return previous;
+  const priorCompletion = await env.DB.prepare('SELECT completed_operation_key, completed_request_hash, completed_response_json FROM tasks WHERE id = ?').bind(taskId).first<{ completed_operation_key: string | null; completed_request_hash: string | null; completed_response_json: string | null }>();
+  if (priorCompletion?.completed_operation_key === operationKey) {
+    if (priorCompletion.completed_request_hash && !safeEqual(priorCompletion.completed_request_hash, requestHash)) throw new BridgeError('idempotency_conflict', 'idempotency_key was already used with different completion content');
+    return parseJson(priorCompletion.completed_response_json) as Record<string, unknown>;
+  }
+  const task = await ownedTask(taskId, leaseToken, env, ['claimed', 'running']);
   const result = validateResult(args.result);
   const serialized = JSON.stringify(result); if (new TextEncoder().encode(serialized).byteLength > MAX_RESULT_BYTES) throw new BridgeError('result_too_large', 'result exceeds 500 KB');
-  const now = new Date().toISOString();
-  const completed = await env.DB.prepare("UPDATE tasks SET status = 'succeeded', result_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?, completed_at = ? WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?").bind(serialized, now, now, taskId, now).run();
-  if (!completed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
-  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'completed', 'grok', serialized, now).run();
-  const response = { task_id: taskId, status: 'succeeded', result };
-  await writeIdempotent(env, 'grok', 'complete_task', operationKey, taskId, response);
+  const response = { task_id: taskId, status: 'succeeded', result }; const serializedResponse = JSON.stringify(response); const now = new Date().toISOString();
+  const completed = await env.DB.prepare("UPDATE tasks SET status = 'succeeded', result_json = ?, lease_owner = NULL, lease_expires_at = NULL, lease_token_hash = NULL, lease_claim_key = NULL, execution_deadline_at = NULL, completed_operation_key = ?, completed_request_hash = ?, completed_response_json = ?, updated_at = ?, completed_at = ? WHERE id = ? AND lease_generation = ? AND lease_token_hash = ? AND cancel_requested_at IS NULL AND status IN ('claimed', 'running') AND lease_expires_at > ? AND execution_deadline_at > ?").bind(serialized, operationKey, requestHash, serializedResponse, now, now, taskId, task.lease_generation, task.lease_token_hash, now, now).run();
+  if (!completed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired, was cancelled, or exceeded its deadline');
+  if (task.lease_attempt_id) await env.DB.prepare("UPDATE execution_attempts SET ended_at = ?, end_reason = 'succeeded', summary_json = ? WHERE id = ? AND ended_at IS NULL").bind(now, JSON.stringify({ result_bytes: new TextEncoder().encode(serialized).byteLength }), task.lease_attempt_id).run();
+  await appendEvent(env, taskId, 'completed', 'grok', { attempt_id: task.lease_attempt_id, result }, now);
+  await writeIdempotent(env, 'grok', 'complete_task', operationKey, taskId, response, args);
   return response;
 }
 
 async function failTask(args: Record<string, unknown>, env: Env) {
-  const taskId = requireTaskId(args.task_id); const operationKey = requireIdempotencyKey(args.idempotency_key);
-  const previous = await readIdempotent(env, 'grok', 'fail_task', operationKey); if (previous) return previous;
-  await ownedTask(taskId, env, ['claimed', 'running']);
+  const taskId = requireTaskId(args.task_id); const leaseToken = requireLeaseToken(args.lease_token); const operationKey = requireIdempotencyKey(args.idempotency_key);
+  const previous = await readIdempotent(env, 'grok', 'fail_task', operationKey, args); if (previous) return previous;
+  const task = await ownedTask(taskId, leaseToken, env, ['claimed', 'running']);
   const rawError = args.error;
   const error = rawError && typeof rawError === 'object' && !Array.isArray(rawError) ? rawError : { message: cleanText(rawError, 2000) };
   const serializedError = JSON.stringify(error);
   if (new TextEncoder().encode(serializedError).byteLength > 10000) throw new BridgeError('invalid_error', 'error exceeds 10 KB');
-  const retryable = args.retryable === true;
-  const current = await env.DB.prepare('SELECT attempts, max_attempts FROM tasks WHERE id = ?').bind(taskId).first<{ attempts: number; max_attempts: number }>();
-  const shouldRetry = retryable && current && current.attempts < current.max_attempts;
-  const status = shouldRetry ? 'queued' : 'failed'; const now = new Date().toISOString();
-  const failed = await env.DB.prepare(`UPDATE tasks SET status = ?, error_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?${shouldRetry ? '' : ', completed_at = ?'} WHERE id = ? AND lease_owner = 'grok' AND status IN ('claimed', 'running') AND lease_expires_at > ?`).bind(...(shouldRetry ? [status, serializedError, now, taskId, now] : [status, serializedError, now, now, taskId, now])).run();
-  if (!failed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired');
-  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, status === 'queued' ? 'requeued' : 'failed', 'grok', serializedError, now).run();
-  const response = { task_id: taskId, status };
-  await writeIdempotent(env, 'grok', 'fail_task', operationKey, taskId, response);
+  const retryable = args.retryable === true; const shouldRetry = retryable && task.attempts < task.max_attempts;
+  const now = new Date().toISOString(); const nextAttemptAt = shouldRetry ? new Date(Date.now() + retryDelayMinutes(task.attempts) * 60000).toISOString() : null;
+  const status = shouldRetry ? 'queued' : 'failed';
+  const failed = await env.DB.prepare(`UPDATE tasks SET status = ?, error_json = ?, lease_owner = NULL, lease_expires_at = NULL, lease_token_hash = NULL, lease_claim_key = NULL, execution_deadline_at = NULL, next_attempt_at = ?, updated_at = ?${shouldRetry ? '' : ', completed_at = ?'} WHERE id = ? AND lease_generation = ? AND lease_token_hash = ? AND cancel_requested_at IS NULL AND status IN ('claimed', 'running') AND lease_expires_at > ? AND execution_deadline_at > ?`).bind(...(shouldRetry ? [status, serializedError, nextAttemptAt, now, taskId, task.lease_generation, task.lease_token_hash, now, now] : [status, serializedError, nextAttemptAt, now, now, taskId, task.lease_generation, task.lease_token_hash, now, now])).run();
+  if (!failed.meta.changes) throw new BridgeError('lease_expired', 'Task lease has expired, was cancelled, or exceeded its deadline');
+  if (task.lease_attempt_id) await env.DB.prepare('UPDATE execution_attempts SET ended_at = ?, end_reason = ?, summary_json = ? WHERE id = ? AND ended_at IS NULL').bind(now, shouldRetry ? 'retryable_failure' : 'failed', JSON.stringify({ error: classifyErrorPayload(error) }), task.lease_attempt_id).run();
+  await appendEvent(env, taskId, shouldRetry ? 'requeued' : 'failed', 'grok', { attempt_id: task.lease_attempt_id, error: classifyErrorPayload(error), next_attempt_at: nextAttemptAt }, now);
+  const response = { task_id: taskId, status, next_attempt_at: nextAttemptAt };
+  await writeIdempotent(env, 'grok', 'fail_task', operationKey, taskId, response, args);
   return response;
 }
 
 async function prepareResultAttachment(args: Record<string, unknown>, env: Env) {
-  const taskId = requireTaskId(args.task_id);
-  await ownedTask(taskId, env, ['claimed', 'running']);
+  const taskId = requireTaskId(args.task_id); const leaseToken = requireLeaseToken(args.lease_token);
+  await ownedTask(taskId, leaseToken, env, ['claimed', 'running']);
   const [item] = validateAttachments([{ name: args.name, mime_type: args.mime_type, size_bytes: args.size_bytes }]);
   const used = await env.DB.prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM attachments WHERE task_id = ?').bind(taskId).first<{ total: number }>();
   if (Number(used?.total ?? 0) + item.sizeBytes > MAX_TASK_ATTACHMENT_BYTES) throw new BridgeError('attachments_too_large', 'Task attachments exceed 25 MB');
@@ -556,11 +602,15 @@ async function prepareResultAttachment(args: Record<string, unknown>, env: Env) 
   return { attachment_id: id, upload_url: await signedAttachmentUrl(env, taskId, id, 'upload', ATTACHMENT_UPLOAD_MINUTES), expires_at: expiresAt };
 }
 
-async function ownedTask(taskId: string, env: Env, statuses: TaskStatus[]) {
-  if (!taskId) throw new BridgeError('invalid_task_id', 'task_id is required');
-  const task = await env.DB.prepare('SELECT id, status FROM tasks WHERE id = ? AND lease_owner = \'grok\'').bind(taskId).first<{ id: string; status: TaskStatus }>();
-  if (!task || !statuses.includes(task.status)) throw new BridgeError('lease_not_owned', 'Task is not owned by the current Grok lease');
-  return task;
+async function ownedTask(taskId: string, leaseToken: string, env: Env, statuses: TaskStatus[]) {
+  const task = await env.DB.prepare('SELECT id, status, attempts, max_attempts, lease_generation, lease_token_hash, lease_attempt_id, lease_expires_at, execution_deadline_at, cancel_requested_at FROM tasks WHERE id = ? AND lease_owner = \'grok\'').bind(taskId).first<Record<string, unknown>>();
+  if (!task || !statuses.includes(task.status as TaskStatus)) throw new BridgeError('lease_not_owned', 'Task is not owned by the current Grok lease');
+  if (!task.lease_token_hash || !safeEqual(String(task.lease_token_hash), await sha256Text(leaseToken))) throw new BridgeError('lease_not_owned', 'Task is not owned by the current Grok lease');
+  const now = new Date().toISOString();
+  if (String(task.lease_expires_at) <= now) throw new BridgeError('lease_expired', 'Task lease has expired');
+  if (String(task.execution_deadline_at) <= now) throw new BridgeError('execution_deadline_exceeded', 'Task execution deadline has elapsed');
+  if (task.cancel_requested_at) throw new BridgeError('cancel_requested', 'Task cancellation was requested');
+  return task as { id: string; status: TaskStatus; attempts: number; max_attempts: number; lease_generation: number; lease_token_hash: string; lease_attempt_id: string | null; lease_expires_at: string; execution_deadline_at: string };
 }
 
 function requireTaskId(value: unknown) {
@@ -601,8 +651,36 @@ async function sha256Hex(data: ArrayBuffer) { const digest = await crypto.subtle
 function cleanText(value: unknown, max: number) { if (typeof value !== 'string') throw new BridgeError('invalid_text', `Text must be 1-${max} characters`); const text = value.trim(); if (!text || text.length > max) throw new BridgeError('invalid_text', `Text must be 1-${max} characters`); return text; }
 function cleanOptionalText(value: unknown, max: number) { if (value === undefined || value === null || value === '') return ''; return cleanText(value, max); }
 function requireIdempotencyKey(value: unknown) { const key = cleanText(value, 200); if (key.length < 8) throw new BridgeError('invalid_idempotency_key', 'idempotency_key must have at least 8 characters'); return key; }
-async function readIdempotent(env: Env, actor: Client, operation: string, key: string): Promise<Record<string, unknown> | null> { const row = await env.DB.prepare('SELECT response_json FROM operation_idempotency WHERE actor = ? AND operation = ? AND idempotency_key = ?').bind(actor, operation, key).first<{ response_json: string }>(); return row ? parseJson(row.response_json) as Record<string, unknown> : null; }
-async function writeIdempotent(env: Env, actor: Client, operation: string, key: string, taskId: string | null, response: Record<string, unknown>) { const result = await env.DB.prepare('INSERT OR IGNORE INTO operation_idempotency (actor, operation, idempotency_key, task_id, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(actor, operation, key, taskId, JSON.stringify(response), new Date().toISOString()).run(); return Boolean(result.meta.changes); }
+function requireLeaseToken(value: unknown) { const token = cleanText(value, 200); if (token.length < 20) throw new BridgeError('invalid_lease_token', 'lease_token is invalid'); return token; }
+function isReadOnlyTaskType(value: string): value is TaskType { return Object.prototype.hasOwnProperty.call(TASK_CAPABILITIES, value) && TASK_CAPABILITIES[value as TaskType].effectClass === 'read_only'; }
+function retryDelayMinutes(attempts: number) { return Math.min(MAX_RETRY_DELAY_MINUTES, 5 * 2 ** Math.max(0, attempts - 1)); }
+function classifyErrorPayload(error: unknown) { return error instanceof Error ? { code: error instanceof BridgeError ? error.code : 'executor_error', message: error.message.slice(0, 500) } : { code: 'executor_error', message: 'Executor reported a failure.' }; }
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value as Record<string, unknown>).sort().map((key) => [key, canonicalize((value as Record<string, unknown>)[key])]));
+  return value;
+}
+async function requestHashFor(args: Record<string, unknown>) { return sha256Text(JSON.stringify(canonicalize(args))); }
+async function sha256Text(value: string) { const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)); return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join(''); }
+async function makeLeaseToken(env: Env, taskId: string, generation: number, claimKey: string) { return `v1.${generation}.${await sign(env.ATTACHMENT_SIGNING_SECRET, `lease:${taskId}:${generation}:${claimKey}`)}`; }
+async function appendEvent(env: Env, taskId: string, eventType: string, actor: string, payload: Record<string, unknown>, createdAt = new Date().toISOString()) {
+  const count = await env.DB.prepare('SELECT COUNT(*) AS count FROM task_events WHERE task_id = ?').bind(taskId).first<{ count: number }>();
+  if (Number(count?.count ?? 0) >= MAX_TASK_EVENTS) throw new BridgeError('event_limit_exceeded', 'Task event limit was reached');
+  await env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, eventType, actor, JSON.stringify(payload), createdAt).run();
+}
+async function readIdempotent(env: Env, actor: Client, operation: string, key: string, args: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+  const row = await env.DB.prepare('SELECT response_json, request_hash FROM operation_idempotency WHERE actor = ? AND operation = ? AND idempotency_key = ?').bind(actor, operation, key).first<{ response_json: string; request_hash: string }>();
+  if (!row) return null;
+  const hash = await requestHashFor(args);
+  if (row.request_hash && !safeEqual(row.request_hash, hash)) throw new BridgeError('idempotency_conflict', 'idempotency_key was already used with different request content');
+  return parseJson(row.response_json) as Record<string, unknown>;
+}
+async function writeIdempotent(env: Env, actor: Client, operation: string, key: string, taskId: string | null, response: Record<string, unknown>, args: Record<string, unknown>) {
+  const hash = await requestHashFor(args);
+  const result = await env.DB.prepare('INSERT OR IGNORE INTO operation_idempotency (actor, operation, idempotency_key, task_id, response_json, request_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(actor, operation, key, taskId, JSON.stringify(response), hash, new Date().toISOString()).run();
+  if (!result.meta.changes) await readIdempotent(env, actor, operation, key, args);
+  return Boolean(result.meta.changes);
+}
 function parseJson(value: unknown) { if (typeof value !== 'string' || !value) return null; try { return JSON.parse(value); } catch { return { raw: '[unparseable]' }; } }
 function requireScope(auth: AuthContext, scope: Scope) { if (!auth.scopes.has(scope)) throw new BridgeError('forbidden', `Missing scope: ${scope}`); }
 function classifyError(error: unknown) { return error instanceof BridgeError ? error.code : 'unexpected_error'; }

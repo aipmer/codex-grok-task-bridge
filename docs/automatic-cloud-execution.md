@@ -26,11 +26,12 @@ Codex create_task
 2. 没有任务时直接结束，不在对话中反复发送空队列消息。
 3. 领取后调用 get_task，阅读 instructions、acceptance_criteria、权限边界和附件说明。
 4. 只在 Grok Bot 云电脑中执行任务；不要使用或修改我当前的本地电脑。
-5. 执行期间定期调用 renew_task_lease，并用 append_progress 回报阶段性进度。
-6. 完成后调用 complete_task，返回 summary、evidence、artifacts、limitations 和 recommended_next_action。
-7. 失败时调用 fail_task，说明失败原因和是否可以安全重试。
-8. 在本对话中报告 task_id、关键进度、最终状态、摘要和下一步。不要调用其他连接器。
-9. 遇到登录、MFA、付款、发布、删除、生产修改或对外发送时暂停并请求人工批准。
+5. 领取响应中的 lease_token 是本次执行的临时凭据。后续 renew_task_lease、append_progress、prepare_result_attachment、complete_task 和 fail_task 都必须携带它，不能在不同任务或不同领取周期复用。
+6. 执行期间定期调用 renew_task_lease，并用 append_progress 回报阶段性进度。遇到 cancel_requested、lease_expired 或 execution_deadline_exceeded 时立即停止，不要继续浏览器操作。
+7. 完成后调用 complete_task，返回 summary、evidence、artifacts、limitations 和 recommended_next_action；网络结果不确定时使用同一个 idempotency_key 重试提交，不要重新执行网页任务。
+8. 失败时调用 fail_task，说明失败原因和是否可以安全重试。
+9. 在本对话中报告 task_id、关键进度、最终状态、摘要和下一步。不要调用其他连接器。
+10. 遇到登录、MFA、付款、发布、删除、生产修改或对外发送时暂停并请求人工批准。
 ```
 
 Routine 可以在电脑关闭时继续运行。若完全不需要本机执行，可把“Execution on Local Computer”设为 `Never allowed`；这只会禁止 Bot 使用你面前的本机，不会影响 Grok Bot 自己的云电脑。
