@@ -73,6 +73,18 @@ task:read task:claim task:progress task:complete
 
 连接器可以由普通对话或定时 Routine 调用。当前 Custom MCP 服务不能把消息主动推送到任意 Grok 对话，也不能通过公开 Webhook 唤醒 Bot，因此 Routine 是受支持的自动轮询入口。
 
+### 在任意 Codex 对话中使用任务桥
+
+在 Codex 用户级配置中注册一次远程 MCP 后，重启 Codex 桌面端即可。同一台主机上的新 Codex 桌面端、CLI 和 IDE 对话都能使用任务桥工具，无需按项目重复配置。
+
+```bash
+codex mcp add grok-bridge \
+  --url https://<bridge-domain>/mcp \
+  --bearer-token-env-var CODEX_GROK_BRIDGE_TOKEN
+```
+
+将 `CODEX_GROK_BRIDGE_TOKEN` 保存在本机环境或密钥管理工具中，绝不把实际值写入仓库配置。用 `codex mcp list` 确认注册；如需只移除此桥接配置，运行 `codex mcp remove grok-bridge` 后重启客户端。
+
 ## 安全边界
 
 - 不上传凭据、Cookie、`.env` 文件、浏览器配置或完整工作区。

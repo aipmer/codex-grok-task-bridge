@@ -72,6 +72,18 @@ After connecting the Custom MCP Connector, verify that Grok can see `claim_next_
 
 The connector is invoked by a conversation or a scheduled Routine. A Custom MCP server cannot currently push a message into an arbitrary Grok conversation or wake a Bot through a public webhook, so the Routine is the supported automatic polling mechanism.
 
+### Use the bridge from any Codex conversation
+
+Register the remote MCP server once at the Codex user level, then restart the Codex desktop app. New Codex desktop, CLI, and IDE conversations on the same host can use the bridge tools without per-project setup.
+
+```bash
+codex mcp add grok-bridge \
+  --url https://<bridge-domain>/mcp \
+  --bearer-token-env-var CODEX_GROK_BRIDGE_TOKEN
+```
+
+Keep `CODEX_GROK_BRIDGE_TOKEN` in the local environment or a secret manager; never place its value in repository configuration. Confirm the registration with `codex mcp list`. To remove only this registration, run `codex mcp remove grok-bridge` and restart the client.
+
 ## Security boundary
 
 - Do not upload credentials, cookies, `.env` files, browser profiles, or complete workspaces.
