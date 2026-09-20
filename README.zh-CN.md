@@ -2,14 +2,14 @@
 
 [English README](README.md)
 
-面向受信任本机 Codex、Claude Code、Cursor、Antigravity（AGY）调用方及一个 Grok Bot 执行端的开源 MCP 任务桥，提供异步任务、租约 fencing、幂等、范围化 OAuth，以及 Cloudflare Workers/D1/R2 支持。
+面向受信任本机 Codex、Claude Code、Cursor 调用方及一个 Grok Bot 执行端的开源 MCP 任务桥，提供异步任务、租约 fencing、幂等、范围化 OAuth，以及 Cloudflare Workers/D1/R2 支持。
 
 本项目不是官方 xAI SDK，也不是 Grok API 集成；不使用 CC Switch Grok OAuth、Grok 私有 API 或无鉴权回退。Hermes 集成属于后续路线，不是 v0.4 的运行依赖。
 
 ## 工作方式
 
 ```text
-Codex / Claude Code / Cursor / AGY ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
+Codex / Claude Code / Cursor ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
                               │
                          D1 + R2
 ```
@@ -87,14 +87,7 @@ codex mcp add grok-bridge \
 
 ### 多智能体调用方
 
-v0.4 支持受信任本机调用方使用独立身份和最小权限范围接入。[多智能体调用方](docs/multi-agent-callers.md)说明 Codex、Claude Code、Cursor、AGY 的接入、受管 Worker Secret、回滚命令，以及无凭据 stdio 代理。调用方不能读取、取消或列出其他调用方的任务。
-
-| 调用方 | 连接方式 | 结果续跑 |
-| --- | --- | --- |
-| Codex | 原生远程 MCP | 可选 `grok-task-continuation` Heartbeat |
-| Claude Code | stdio 代理 | 当前对话中的任务级后续处理 |
-| Cursor | stdio 代理 | 当前对话中的任务级后续处理 |
-| AGY | 原生 MCP 注册加 stdio 代理 | 当前 AGY 对话中的任务级后续处理 |
+v0.4 支持受信任本机 Codex、Claude Code 与 Cursor 使用独立身份和最小权限范围接入。[多智能体调用方](docs/multi-agent-callers.md)说明受管 Worker Secret、配置备份、回滚命令，以及供没有原生 Bearer 环境变量入口的客户端使用的无凭据 stdio 代理。调用方不能读取、取消或列出其他调用方的任务。
 
 ## 安全边界
 
@@ -141,7 +134,7 @@ cp -R skills/grok-task-continuation ~/.codex/skills/
 
 ### v0.4 — 多智能体调用方
 
-- Codex、Claude Code、Cursor 与 AGY 以不同的受信任本机调用方身份认证。
+- Codex、Claude Code 与 Cursor 以不同的受信任本机调用方身份认证。
 - 调用方凭据以 SHA-256 摘要存入 Worker Secret，可独立禁用或轮换。
 - 任务按 `owner_client_id` 私有隔离；Grok 仍是唯一执行者。
 
