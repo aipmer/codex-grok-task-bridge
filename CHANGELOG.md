@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.1 — 2026-09-20
+
+- Added documented AGY as a direct MCP caller alongside Codex, Claude Code, and Cursor.
+- Added a caller compatibility table and AGY backup, setup, validation, and rollback guidance.
+- Updated the stdio proxy to accept the existing `CODEX_GROK_BRIDGE_TOKEN` name for a temporary shared-identity setup without storing a token in AGY configuration.
+
 ## v0.4.0 — 2026-09-20
 
 - Added managed, scoped caller identities for trusted local Codex, Claude Code, and Cursor MCP clients.

@@ -11,7 +11,8 @@ Set the Worker secret `BRIDGE_CLIENTS` before adding a second caller. Its JSON v
   "clients": [
     { "client_id": "codex", "token_sha256": "<64-lowercase-hex-digest>", "scopes": ["task:create", "task:read", "task:cancel"], "enabled": true },
     { "client_id": "claude-code", "token_sha256": "<64-lowercase-hex-digest>", "scopes": ["task:create", "task:read"], "enabled": true },
-    { "client_id": "cursor", "token_sha256": "<64-lowercase-hex-digest>", "scopes": ["task:create", "task:read", "task:cancel"], "enabled": true }
+    { "client_id": "cursor", "token_sha256": "<64-lowercase-hex-digest>", "scopes": ["task:create", "task:read", "task:cancel"], "enabled": true },
+    { "client_id": "agy", "token_sha256": "<64-lowercase-hex-digest>", "scopes": ["task:create", "task:read", "task:cancel"], "enabled": true }
   ]
 }
 ```
@@ -60,6 +61,19 @@ claude mcp list
 
 Rollback with `claude mcp remove grok-bridge`. Before manually editing Cursor's MCP configuration, create a timestamped copy of its existing configuration. Add a stdio server whose command is `node` and whose sole argument is the absolute path to `bin/bridge-mcp-stdio.mjs`; start Cursor with `GROK_BRIDGE_URL` and that Cursor client's `GROK_BRIDGE_TOKEN` in its environment. Remove that server entry to roll back.
 
+### Antigravity (AGY)
+
+AGY supports native MCP registration. Back up its global configuration before registering the local proxy:
+
+```bash
+cp ~/.gemini/config/mcp_config.json ~/.gemini/config/mcp_config.json.grok-bridge-backup-$(date +%Y%m%d%H%M%S)
+agy mcp add --env GROK_BRIDGE_URL=https://<bridge-domain>/mcp \
+  grok-bridge node /absolute/path/to/codex-grok-task-bridge/bin/bridge-mcp-stdio.mjs
+agy mcp list
+```
+
+The proxy accepts `GROK_BRIDGE_TOKEN`; for a temporary shared-identity setup it also accepts the existing `CODEX_GROK_BRIDGE_TOKEN` environment variable. Neither value is saved in AGY's MCP configuration. Remove the registration with `agy mcp remove grok-bridge`; restore the backup only when no later intentional MCP edits need to be retained.
+
 ## Caller workflow
 
 1. Create only registered `read_only` task types and retain the returned `task_id`.
@@ -67,4 +81,4 @@ Rollback with `claude mcp remove grok-bridge`. Before manually editing Cursor's 
 3. Evaluate evidence, limitations, and `recommended_next_action` before continuing the originating work.
 4. Do not attempt to access another caller's task or let a caller become an executor.
 
-Codex may additionally use the optional [continuation Skill](../skills/grok-task-continuation/SKILL.md). Other clients should implement their own task-local follow-up flow; the Worker cannot wake arbitrary conversations.
+Codex may additionally use the optional [continuation Skill](../skills/grok-task-continuation/SKILL.md). Claude Code, Cursor, and AGY should implement their own task-local follow-up flow; the Worker cannot wake arbitrary conversations.
