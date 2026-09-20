@@ -2,14 +2,14 @@
 
 [English README](README.md)
 
-面向 Codex 和 Grok Bot 的开源 MCP 任务桥，提供异步任务、租约 fencing、幂等、范围化 OAuth，以及 Cloudflare Workers/D1/R2 支持。Codex 创建任务，已连接的执行端领取任务并返回结构化结果与证据。
+面向受信任本机 Codex、Claude Code、Cursor 调用方及一个 Grok Bot 执行端的开源 MCP 任务桥，提供异步任务、租约 fencing、幂等、范围化 OAuth，以及 Cloudflare Workers/D1/R2 支持。
 
-本项目不是官方 xAI SDK，也不是 Grok API 集成；不使用 CC Switch Grok OAuth、Grok 私有 API 或无鉴权回退。Hermes 集成属于后续路线，不是 v0.3 的运行依赖。
+本项目不是官方 xAI SDK，也不是 Grok API 集成；不使用 CC Switch Grok OAuth、Grok 私有 API 或无鉴权回退。Hermes 集成属于后续路线，不是 v0.4 的运行依赖。
 
 ## 工作方式
 
 ```text
-Codex ── Bearer MCP ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
+Codex / Claude Code / Cursor ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
                               │
                          D1 + R2
 ```
@@ -20,7 +20,7 @@ Codex ── Bearer MCP ──> Cloudflare Task Bridge <── OAuth MCP ── 
 
 ## 当前状态
 
-- v0.2 增加租约令牌与代次 fencing、执行尝试记录、受控延迟重试、取消请求和可重放的完成响应。
+- v0.4 增加隔离的具名调用方与每客户端令牌摘要；调用方只能创建和读取自己的任务，Grok 仍是唯一执行者。
 - 已完成一次公开 X 账号只读调研案例；该案例通过手动触发的 Grok Bot 对话验证，不代表 Routine 无人值守触发能力已完成验收。
 - Grok 仅拥有读取、领取、更新进度、续租和提交结果的权限。
 - 不提供公共共享 Worker 实例；请部署自己的 Cloudflare 资源。
@@ -61,7 +61,7 @@ npm run smoke
 
 [公开 X 账号调研案例](docs/case-study-public-x-research-2026-09-13.md)记录了一次只读任务：让 Grok Bot 抓取某个 X 账号当天的公开发文，并返回带证据的精简摘要。案例验证了云端浏览器调研和结果回传；Routine 的无人值守触发仍需单独验证。
 
-## Codex 和 Grok Bot 配置
+## 调用方和 Grok Bot 配置
 
 Codex 使用专用 Bearer Token 访问 `/mcp`。Grok Bot 通过 OAuth 发现、授权码和 PKCE 流程，经 `/grok/mcp` 访问。Grok 的权限范围限制为：
 
@@ -80,10 +80,14 @@ task:read task:claim task:progress task:complete
 ```bash
 codex mcp add grok-bridge \
   --url https://<bridge-domain>/mcp \
-  --bearer-token-env-var CODEX_GROK_BRIDGE_TOKEN
+  --bearer-token-env-var GROK_BRIDGE_TOKEN
 ```
 
-将 `CODEX_GROK_BRIDGE_TOKEN` 保存在本机环境或密钥管理工具中，绝不把实际值写入仓库配置。用 `codex mcp list` 确认注册；如需只移除此桥接配置，运行 `codex mcp remove grok-bridge` 后重启客户端。
+将 `GROK_BRIDGE_TOKEN` 保存在本机环境或密钥管理工具中，绝不把实际值写入仓库配置。用 `codex mcp list` 确认注册；如需只移除此桥接配置，运行 `codex mcp remove grok-bridge` 后重启客户端。
+
+### 多智能体调用方
+
+v0.4 支持受信任本机 Codex、Claude Code 与 Cursor 使用独立身份和最小权限范围接入。[多智能体调用方](docs/multi-agent-callers.md)说明受管 Worker Secret、配置备份、回滚命令，以及供没有原生 Bearer 环境变量入口的客户端使用的无凭据 stdio 代理。调用方不能读取、取消或列出其他调用方的任务。
 
 ## 安全边界
 
@@ -127,6 +131,12 @@ cp -R skills/grok-task-continuation ~/.codex/skills/
 - 可选 `grok-task-continuation` Skill 使原始 Codex 任务负责审阅终态结果并完成后续工作，而不是止步于状态通知。
 - 按任务创建的 Heartbeat 只轮询该 Codex 任务生成的 `task_id`，任务未结束时保持静默，不扫描其他对话。
 - 流程会保留证据和限制说明；任何新提出的外部副作用仍需新的授权。
+
+### v0.4 — 多智能体调用方
+
+- Codex、Claude Code 与 Cursor 以不同的受信任本机调用方身份认证。
+- 调用方凭据以 SHA-256 摘要存入 Worker Secret，可独立禁用或轮换。
+- 任务按 `owner_client_id` 私有隔离；Grok 仍是唯一执行者。
 
 ### 后续 — Hermes × Grok Bot
 

@@ -2,14 +2,14 @@
 
 [Chinese README](README.zh-CN.md)
 
-Open-source MCP task bridge for Codex and Grok Bot, with asynchronous jobs, fenced leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2. Codex creates a task; a connected executor claims it and returns structured results and evidence.
+Open-source MCP task bridge for trusted local Codex, Claude Code, and Cursor callers plus one Grok Bot executor, with asynchronous jobs, fenced leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2.
 
-This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.3.
+This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.4.
 
 ## How it works
 
 ```text
-Codex ── Bearer MCP ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
+Codex / Claude Code / Cursor ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
                               │
                          D1 + R2
 ```
@@ -20,7 +20,7 @@ The target unattended setup uses a Grok Bot Routine to call `claim_next_task` on
 
 ## Current status
 
-- v0.2 adds fenced lease tokens, attempt history, delayed retries, cancellation requests, and replay-safe completion responses. The live smoke test so far used a manually prompted grok.com conversation; unattended Grok Bot execution has not yet been verified.
+- v0.4 adds isolated named callers and per-client token digests. Callers can create and read only their own tasks; Grok remains the sole executor.
 - Grok is limited to read, claim, progress, lease renewal, and result submission.
 - No public shared Worker instance is provided. Deploy your own Cloudflare resources.
 - The code has been validated with Cloudflare Worker, D1, R2, and OAuth 2.1 + PKCE.
@@ -60,7 +60,7 @@ The [Codex ↔ Grok connector protocol smoke test](docs/case-study-codex-grok-sm
 
 The [public X account research case](docs/case-study-public-x-research-2026-09-13.md) records a read-only task that asked Grok Bot to collect the day's public posts from an X account and return a concise evidence-backed summary. It verifies cloud-browser research through a manually triggered Bot conversation; Routine-based unattended triggering remains a separate capability to verify.
 
-## Codex and Grok Bot setup
+## Caller and Grok Bot setup
 
 Codex uses the `/mcp` endpoint with a dedicated Bearer token. Grok Bot uses `/grok/mcp` through the OAuth discovery, authorization-code, and PKCE flow. The Grok scope set is limited to:
 
@@ -79,10 +79,14 @@ Register the remote MCP server once at the Codex user level, then restart the Co
 ```bash
 codex mcp add grok-bridge \
   --url https://<bridge-domain>/mcp \
-  --bearer-token-env-var CODEX_GROK_BRIDGE_TOKEN
+  --bearer-token-env-var GROK_BRIDGE_TOKEN
 ```
 
-Keep `CODEX_GROK_BRIDGE_TOKEN` in the local environment or a secret manager; never place its value in repository configuration. Confirm the registration with `codex mcp list`. To remove only this registration, run `codex mcp remove grok-bridge` and restart the client.
+Keep `GROK_BRIDGE_TOKEN` in the local environment or a secret manager; never place its value in repository configuration. Confirm the registration with `codex mcp list`. To remove only this registration, run `codex mcp remove grok-bridge` and restart the client.
+
+### Multi-agent callers
+
+v0.4 supports trusted local Codex, Claude Code, and Cursor callers with independent identities and least-privilege scopes. [Multi-agent callers](docs/multi-agent-callers.md) documents the managed Worker Secret, setup backups, rollback commands, and the credential-free stdio proxy used by clients without a native bearer-token environment setting. Callers cannot read, cancel, or list another caller's tasks.
 
 ## Security boundary
 
@@ -126,6 +130,12 @@ This is a per-task continuation consumer, not a Worker callback. Neither the Wor
 - Optional `grok-task-continuation` Skill keeps the originating Codex task responsible for evaluating a terminal bridge result and completing the requested follow-up.
 - A per-task heartbeat polls only the task IDs created in that Codex task; it is silent while work is pending and does not scan unrelated conversations.
 - The documented flow preserves evidence and limitations, and requires fresh authority for any newly proposed external side effect.
+
+### v0.4 — Multi-agent callers
+
+- Codex, Claude Code, and Cursor authenticate as separate trusted local caller identities.
+- Caller credentials are SHA-256 digests in a Worker Secret; each caller can be independently disabled or rotated.
+- Tasks are private to their `owner_client_id`; Grok remains the only executor.
 
 ### Later — Hermes × Grok Bot
 
