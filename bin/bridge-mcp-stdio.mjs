@@ -2,9 +2,9 @@
 import readline from 'node:readline';
 
 const bridgeUrl = process.env.GROK_BRIDGE_URL;
-const token = process.env.GROK_BRIDGE_TOKEN;
+const token = process.env.GROK_BRIDGE_TOKEN ?? process.env.CODEX_GROK_BRIDGE_TOKEN;
 if (!bridgeUrl || !token) {
-  process.stderr.write('GROK_BRIDGE_URL and GROK_BRIDGE_TOKEN must be set.\n');
+  process.stderr.write('GROK_BRIDGE_URL and GROK_BRIDGE_TOKEN (or CODEX_GROK_BRIDGE_TOKEN) must be set.\n');
   process.exit(1);
 }
 

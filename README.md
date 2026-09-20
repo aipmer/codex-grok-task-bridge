@@ -2,14 +2,14 @@
 
 [Chinese README](README.zh-CN.md)
 
-Open-source MCP task bridge for trusted local Codex, Claude Code, and Cursor callers plus one Grok Bot executor, with asynchronous jobs, fenced leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2.
+Open-source MCP task bridge for trusted local Codex, Claude Code, Cursor, and Antigravity (AGY) callers plus one Grok Bot executor, with asynchronous jobs, fenced leases, idempotency, scoped OAuth, and Cloudflare Workers/D1/R2.
 
 This is not an official xAI SDK or Grok API integration. It does not use CC Switch Grok OAuth, private Grok APIs, or an unauthenticated fallback. Hermes integration is planned for a later release and is not a runtime dependency of v0.4.
 
 ## How it works
 
 ```text
-Codex / Claude Code / Cursor ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
+Codex / Claude Code / Cursor / AGY ──> Cloudflare Task Bridge <── OAuth MCP ── Grok Bot
                               │
                          D1 + R2
 ```
@@ -86,7 +86,14 @@ Keep `GROK_BRIDGE_TOKEN` in the local environment or a secret manager; never pla
 
 ### Multi-agent callers
 
-v0.4 supports trusted local Codex, Claude Code, and Cursor callers with independent identities and least-privilege scopes. [Multi-agent callers](docs/multi-agent-callers.md) documents the managed Worker Secret, setup backups, rollback commands, and the credential-free stdio proxy used by clients without a native bearer-token environment setting. Callers cannot read, cancel, or list another caller's tasks.
+v0.4 supports trusted local callers with independent identities and least-privilege scopes. [Multi-agent callers](docs/multi-agent-callers.md) documents Codex, Claude Code, Cursor, and AGY setup, the managed Worker Secret, rollback commands, and the credential-free stdio proxy. Callers cannot read, cancel, or list another caller's tasks.
+
+| Caller | Connection | Continuation |
+| --- | --- | --- |
+| Codex | Native remote MCP | Optional `grok-task-continuation` heartbeat |
+| Claude Code | Stdio proxy | Task-local follow-up in the active conversation |
+| Cursor | Stdio proxy | Task-local follow-up in the active conversation |
+| AGY | Native MCP registration plus stdio proxy | Task-local follow-up in the active AGY conversation |
 
 ## Security boundary
 
@@ -133,7 +140,7 @@ This is a per-task continuation consumer, not a Worker callback. Neither the Wor
 
 ### v0.4 — Multi-agent callers
 
-- Codex, Claude Code, and Cursor authenticate as separate trusted local caller identities.
+- Codex, Claude Code, Cursor, and AGY authenticate as separate trusted local caller identities.
 - Caller credentials are SHA-256 digests in a Worker Secret; each caller can be independently disabled or rotated.
 - Tasks are private to their `owner_client_id`; Grok remains the only executor.
 
