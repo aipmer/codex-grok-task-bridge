@@ -8,6 +8,7 @@ import {
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { BridgeError, MAX_TASK_ATTACHMENT_BYTES, safeEqual, validateAttachments, validateResult } from './validation';
 import { isAuthorizationCallback, validateOAuthClientRegistration } from './oauth-callbacks';
+import { CALLER_SCOPES, parseManagedClients } from './clients';
 
 export { safeEqual, validateAttachments, validateResult } from './validation';
 
@@ -16,6 +17,7 @@ export interface Env {
   ATTACHMENTS: R2Bucket;
   OAUTH_KV: KVNamespace;
   ENVIRONMENT: string;
+  BRIDGE_CLIENTS?: string;
   CODEX_TOKEN: string;
   GROK_TOKEN: string;
   GROK_OAUTH_LOGIN_CODE: string;
@@ -23,7 +25,7 @@ export interface Env {
   PUBLIC_BASE_URL: string;
 }
 
-type Client = 'codex' | 'grok';
+type Client = string;
 type Scope = 'task:create' | 'task:read' | 'task:cancel' | 'task:claim' | 'task:progress' | 'task:complete';
 type TaskStatus = 'queued' | 'claimed' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 type AttachmentDirection = 'input' | 'result';
@@ -36,6 +38,7 @@ const TASK_CAPABILITIES = {
 type TaskType = keyof typeof TASK_CAPABILITIES;
 
 const PROTOCOL_VERSION = '2025-03-26';
+const BRIDGE_VERSION = '0.4.0';
 const LEASE_MINUTES = 15;
 const ATTACHMENT_UPLOAD_MINUTES = 15;
 const ATTACHMENT_RETENTION_DAYS = 7;
@@ -54,11 +57,11 @@ const MAX_RETRY_DELAY_MINUTES = 60;
 const TERMINAL = new Set<TaskStatus>(['succeeded', 'failed', 'cancelled']);
 
 const TOOL_DEFINITIONS = [
-  tool('create_task', 'Create a Codex task for Grok Bot.', {
-    type: 'object', required: ['source', 'task_type', 'title', 'instructions', 'idempotency_key'],
+  tool('create_task', 'Create a read-only task for Grok Bot.', {
+    type: 'object', required: ['task_type', 'title', 'instructions', 'idempotency_key'],
     properties: {
-      source: { type: 'string', enum: ['codex'] },
-      task_type: { type: 'string', enum: ['codex_research'] },
+      source: { type: 'string', description: 'Deprecated compatibility field. If supplied, it must equal the authenticated client_id.' },
+      task_type: { type: 'string', enum: Object.keys(TASK_CAPABILITIES) },
       title: { type: 'string', minLength: 1, maxLength: 200 },
       instructions: { type: 'string', minLength: 1, maxLength: 50000 },
       acceptance_criteria: { type: 'string', maxLength: 10000 },
@@ -72,7 +75,7 @@ const TOOL_DEFINITIONS = [
   }),
   tool('list_tasks', 'List tasks visible to the authenticated client.', {
     type: 'object', properties: {
-      status: { type: 'string' }, source: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 },
+      status: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 },
     },
   }),
   tool('cancel_task', 'Cancel a queued or claimed task.', {
@@ -183,7 +186,7 @@ async function handleMcp(request: Request, env: Env, suppliedAuth?: AuthContext)
   let requestId: JSONRPCRequest['id'] = null;
   try {
     if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { Allow: 'POST' });
-    const auth = suppliedAuth ?? authenticate(request, env);
+    const auth = suppliedAuth ?? await authenticate(request, env);
     if (!auth) return json({ error: 'unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer' });
     const contentLength = Number(request.headers.get('content-length') ?? 0);
     if (Number.isFinite(contentLength) && contentLength > 1024 * 1024) return json({ error: 'request_too_large' }, 413);
@@ -200,7 +203,7 @@ async function handleMcp(request: Request, env: Env, suppliedAuth?: AuthContext)
     requestId = body.id ?? null;
     if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') return rpcError(body.id, -32600, 'Invalid JSON-RPC request');
     if (body.method === 'notifications/initialized' || body.method.startsWith('notifications/')) return new Response(null, { status: 204 });
-    if (body.method === 'initialize') return rpcResult(body.id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'codex-grok-task-bridge', version: '0.2.0' } });
+    if (body.method === 'initialize') return rpcResult(body.id, { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: 'codex-grok-task-bridge', version: BRIDGE_VERSION } });
     if (body.method === 'ping') return rpcResult(body.id, {});
     if (body.method === 'tools/list') return rpcResult(body.id, { tools: TOOL_DEFINITIONS.filter((item) => auth.scopes.has(TOOL_REQUIRED_SCOPE[item.name])) });
     if (body.method !== 'tools/call') return rpcError(body.id, -32601, 'Method not found');
@@ -334,12 +337,19 @@ function scopeDescription(scope: Scope): string {
 interface JSONRPCRequest { jsonrpc?: string; id?: string | number | null; method?: string; params?: unknown; }
 interface AuthContext { client: Client; scopes: Set<Scope>; }
 
-function authenticate(request: Request, env: Env): AuthContext | null {
+async function authenticate(request: Request, env: Env): Promise<AuthContext | null> {
   const header = request.headers.get('Authorization') ?? '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   if (!token) return null;
-  if (safeEqual(token, env.CODEX_TOKEN ?? '')) return { client: 'codex', scopes: new Set(['task:create', 'task:read', 'task:cancel']) };
   if (safeEqual(token, env.GROK_TOKEN ?? '')) return { client: 'grok', scopes: new Set(['task:read', 'task:claim', 'task:progress', 'task:complete']) };
+  const clients = parseManagedClients(env.BRIDGE_CLIENTS);
+  if (clients) {
+    const digest = await sha256Text(token);
+    const matched = clients.find((client) => client.enabled && safeEqual(client.tokenSha256, digest));
+    return matched ? { client: matched.clientId, scopes: new Set<Scope>(matched.scopes) } : null;
+  }
+  // Compatibility only: deploy BRIDGE_CLIENTS before adding a second caller.
+  if (safeEqual(token, env.CODEX_TOKEN ?? '')) return { client: 'codex', scopes: new Set(CALLER_SCOPES) };
   return null;
 }
 
@@ -370,18 +380,20 @@ async function callTool(name: string, args: Record<string, unknown>, auth: AuthC
 }
 
 async function createTask(args: Record<string, unknown>, auth: AuthContext, env: Env) {
-  const source = typeof args.source === 'string' ? args.source : '';
-  if (source !== auth.client || source !== 'codex') throw new BridgeError('forbidden', 'source does not match authenticated client');
+  const declaredSource = args.source;
+  if (declaredSource !== undefined && (typeof declaredSource !== 'string' || declaredSource !== auth.client)) throw new BridgeError('forbidden', 'source does not match authenticated client');
   const taskType = typeof args.task_type === 'string' ? args.task_type : '';
-  if (taskType !== 'codex_research' || !isReadOnlyTaskType(taskType)) throw new BridgeError('invalid_task_type', 'Codex may only create registered read_only tasks');
+  if (!isReadOnlyTaskType(taskType)) throw new BridgeError('invalid_task_type', 'Clients may only create registered read_only tasks');
   const title = cleanText(args.title, 200);
   const instructions = cleanText(args.instructions, 50000);
   const acceptance = cleanOptionalText(args.acceptance_criteria, 10000);
   const idempotencyKey = cleanText(args.idempotency_key, 200);
   if (idempotencyKey.length < 8) throw new BridgeError('invalid_idempotency_key', 'idempotency_key must have at least 8 characters');
   const attachments = validateAttachments(args.attachments);
-  const requestHash = await requestHashFor(args);
-  const existing = await env.DB.prepare('SELECT id, create_request_hash FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string; create_request_hash: string }>();
+  const normalizedArgs = { ...args, source: auth.client };
+  const requestHash = await requestHashFor(normalizedArgs);
+  const storedIdempotencyKey = scopedIdempotencyKey(auth.client, idempotencyKey);
+  const existing = await findExistingCreateTask(env, auth.client, storedIdempotencyKey, idempotencyKey);
   if (existing) {
     if (existing.create_request_hash && !safeEqual(existing.create_request_hash, requestHash)) throw new BridgeError('idempotency_conflict', 'idempotency_key was already used with different task content');
     return getTask(existing.id, auth, env);
@@ -391,7 +403,7 @@ async function createTask(args: Record<string, unknown>, auth: AuthContext, env:
   const rawPriority = args.priority ?? 50;
   if (typeof rawPriority !== 'number' || !Number.isInteger(rawPriority) || rawPriority < 0 || rawPriority > 100) throw new BridgeError('invalid_priority', 'priority must be an integer between 0 and 100');
   const priority = rawPriority;
-  const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO tasks (id, source, task_type, title, instructions, acceptance_criteria, priority, status, effect_class, idempotency_key, create_request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 'read_only', ?, ?, ?, ?)`).bind(taskId, source, taskType, title, instructions, acceptance, priority, idempotencyKey, requestHash, now, now), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'created', auth.client, '{}', now)];
+  const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO tasks (id, source, owner_client_id, task_type, title, instructions, acceptance_criteria, priority, status, effect_class, idempotency_key, create_request_hash, created_at, updated_at) VALUES (?, 'codex', ?, ?, ?, ?, ?, ?, 'queued', 'read_only', ?, ?, ?, ?)`).bind(taskId, auth.client, taskType, title, instructions, acceptance, priority, storedIdempotencyKey, requestHash, now, now), env.DB.prepare('INSERT INTO task_events (task_id, event_type, actor, payload_json, created_at) VALUES (?, ?, ?, ?, ?)').bind(taskId, 'created', auth.client, '{}', now)];
   const responseAttachments: Record<string, unknown>[] = [];
   for (const item of attachments) {
     const id = crypto.randomUUID();
@@ -405,7 +417,7 @@ async function createTask(args: Record<string, unknown>, auth: AuthContext, env:
   } catch (error) {
     // Two first attempts with the same key can race before either sees the
     // existing row. Treat the unique-key winner as the idempotent result.
-    const winner = await env.DB.prepare('SELECT id, create_request_hash FROM tasks WHERE source = ? AND idempotency_key = ?').bind(source, idempotencyKey).first<{ id: string; create_request_hash: string }>();
+    const winner = await findExistingCreateTask(env, auth.client, storedIdempotencyKey, idempotencyKey);
     if (winner) {
       if (winner.create_request_hash && !safeEqual(winner.create_request_hash, requestHash)) throw new BridgeError('idempotency_conflict', 'idempotency_key was already used with different task content');
       return getTask(winner.id, auth, env);
@@ -419,7 +431,7 @@ async function getTask(taskId: string, auth: AuthContext, env: Env) {
   if (!taskId) throw new BridgeError('invalid_task_id', 'task_id is required');
   const task = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(taskId).first<Record<string, unknown>>();
   if (!task) throw new BridgeError('not_found', 'Task not found');
-  if (auth.client !== 'grok' && task.source !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another source');
+  if (auth.client !== 'grok' && task.owner_client_id !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another client');
   if (auth.client === 'grok' && task.lease_owner !== 'grok') {
     const previouslyClaimed = await env.DB.prepare("SELECT 1 AS claimed FROM task_events WHERE task_id = ? AND event_type = 'claimed' AND actor = 'grok' LIMIT 1").bind(taskId).first<{ claimed: number }>();
     if (!previouslyClaimed) throw new BridgeError('forbidden', 'Task is not assigned to Grok Bot');
@@ -428,7 +440,7 @@ async function getTask(taskId: string, auth: AuthContext, env: Env) {
   const attempts = await env.DB.prepare('SELECT id, lease_generation, executor, started_at, ended_at, end_reason, summary_json FROM execution_attempts WHERE task_id = ? ORDER BY lease_generation ASC').bind(taskId).all<Record<string, string>>();
   const attachments = await env.DB.prepare('SELECT id, name, mime_type, size_bytes, direction, upload_status, sha256, expires_at FROM attachments WHERE task_id = ?').bind(taskId).all<Record<string, string>>();
   const attachmentResults = await Promise.all((attachments.results ?? []).map(async (item) => ({ ...item, download_url: item.upload_status === 'uploaded' && item.expires_at > new Date().toISOString() ? await signedAttachmentUrl(env, taskId, item.id, 'download', ATTACHMENT_RETENTION_DAYS * 24 * 60) : null })));
-  return { task_id: task.id, source: task.source, task_type: task.task_type, effect_class: task.effect_class, title: task.title, instructions: task.instructions, acceptance_criteria: task.acceptance_criteria, priority: task.priority, status: task.status, attempts: task.attempts, lease_generation: task.lease_generation, lease_expires_at: task.lease_expires_at, execution_deadline_at: task.execution_deadline_at, next_attempt_at: task.next_attempt_at, cancel_requested: Boolean(task.cancel_requested_at), created_at: task.created_at, updated_at: task.updated_at, completed_at: task.completed_at, result: parseJson(task.result_json), error: parseJson(task.error_json), events: (events.results ?? []).map((e) => ({ event_type: e.event_type, actor: e.actor, created_at: e.created_at, payload: parseJson(e.payload_json) })), execution_attempts: (attempts.results ?? []).map((attempt) => ({ attempt_id: attempt.id, lease_generation: attempt.lease_generation, executor: attempt.executor, started_at: attempt.started_at, ended_at: attempt.ended_at, end_reason: attempt.end_reason, summary: parseJson(attempt.summary_json) })), attachments: attachmentResults };
+  return { task_id: task.id, source: task.owner_client_id, owner_client_id: task.owner_client_id, task_type: task.task_type, effect_class: task.effect_class, title: task.title, instructions: task.instructions, acceptance_criteria: task.acceptance_criteria, priority: task.priority, status: task.status, attempts: task.attempts, lease_generation: task.lease_generation, lease_expires_at: task.lease_expires_at, execution_deadline_at: task.execution_deadline_at, next_attempt_at: task.next_attempt_at, cancel_requested: Boolean(task.cancel_requested_at), created_at: task.created_at, updated_at: task.updated_at, completed_at: task.completed_at, result: parseJson(task.result_json), error: parseJson(task.error_json), events: (events.results ?? []).map((e) => ({ event_type: e.event_type, actor: e.actor, created_at: e.created_at, payload: parseJson(e.payload_json) })), execution_attempts: (attempts.results ?? []).map((attempt) => ({ attempt_id: attempt.id, lease_generation: attempt.lease_generation, executor: attempt.executor, started_at: attempt.started_at, ended_at: attempt.ended_at, end_reason: attempt.end_reason, summary: parseJson(attempt.summary_json) })), attachments: attachmentResults };
 }
 
 async function listTasks(args: Record<string, unknown>, auth: AuthContext, env: Env) {
@@ -437,12 +449,13 @@ async function listTasks(args: Record<string, unknown>, auth: AuthContext, env: 
   const limit = rawLimit;
   const status = args.status === undefined ? '' : cleanText(args.status, 20);
   if (status && !['queued', 'claimed', 'running', 'succeeded', 'failed', 'cancelled'].includes(status)) throw new BridgeError('invalid_status', 'Unsupported task status');
-  const sourceArg = args.source === undefined ? '' : cleanText(args.source, 20);
+  const sourceArg = args.source === undefined ? '' : cleanText(args.source, 64);
+  if (auth.client !== 'grok' && sourceArg && sourceArg !== auth.client) throw new BridgeError('forbidden', 'source does not match authenticated client');
   const source = auth.client === 'grok' ? sourceArg : auth.client;
   const clauses = auth.client === 'grok' ? ["lease_owner = 'grok'"] : ['1 = 1']; const values: (string | number)[] = [];
-  if (source) { clauses.push('source = ?'); values.push(source); }
+  if (source) { clauses.push(auth.client === 'grok' ? 'owner_client_id = ?' : 'owner_client_id = ?'); values.push(source); }
   if (status) { clauses.push('status = ?'); values.push(status); }
-  const result = await env.DB.prepare(`SELECT id, source, task_type, title, status, attempts, created_at, updated_at FROM tasks WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC LIMIT ?`).bind(...values, limit).all();
+  const result = await env.DB.prepare(`SELECT id, owner_client_id AS source, task_type, title, status, attempts, created_at, updated_at FROM tasks WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC LIMIT ?`).bind(...values, limit).all();
   return { tasks: result.results ?? [] };
 }
 
@@ -451,9 +464,9 @@ async function cancelTask(args: Record<string, unknown>, auth: AuthContext, env:
   const operationKey = requireIdempotencyKey(args.idempotency_key);
   const previous = await readIdempotent(env, auth.client, 'cancel_task', operationKey, args);
   if (previous) return previous;
-  const task = await env.DB.prepare('SELECT status, source FROM tasks WHERE id = ?').bind(taskId).first<{ status: TaskStatus; source: Client }>();
+  const task = await env.DB.prepare('SELECT status, owner_client_id FROM tasks WHERE id = ?').bind(taskId).first<{ status: TaskStatus; owner_client_id: Client }>();
   if (!task) throw new BridgeError('not_found', 'Task not found');
-  if (task.source !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another source');
+  if (task.owner_client_id !== auth.client) throw new BridgeError('forbidden', 'Task belongs to another client');
   if (task.status === 'running') {
     const now = new Date().toISOString();
     const requested = await env.DB.prepare("UPDATE tasks SET cancel_requested_at = COALESCE(cancel_requested_at, ?), cancel_requested_by = COALESCE(cancel_requested_by, ?), updated_at = ? WHERE id = ? AND status = 'running'").bind(now, auth.client, now, taskId).run();
@@ -652,6 +665,12 @@ function cleanText(value: unknown, max: number) { if (typeof value !== 'string')
 function cleanOptionalText(value: unknown, max: number) { if (value === undefined || value === null || value === '') return ''; return cleanText(value, max); }
 function requireIdempotencyKey(value: unknown) { const key = cleanText(value, 200); if (key.length < 8) throw new BridgeError('invalid_idempotency_key', 'idempotency_key must have at least 8 characters'); return key; }
 function requireLeaseToken(value: unknown) { const token = cleanText(value, 200); if (token.length < 20) throw new BridgeError('invalid_lease_token', 'lease_token is invalid'); return token; }
+function scopedIdempotencyKey(clientId: string, key: string) { return `${clientId}:${key}`; }
+async function findExistingCreateTask(env: Env, clientId: string, scopedKey: string, legacyKey: string) {
+  const exact = await env.DB.prepare('SELECT id, create_request_hash FROM tasks WHERE owner_client_id = ? AND idempotency_key = ?').bind(clientId, scopedKey).first<{ id: string; create_request_hash: string }>();
+  if (exact || clientId !== 'codex') return exact;
+  return env.DB.prepare('SELECT id, create_request_hash FROM tasks WHERE owner_client_id = ? AND idempotency_key = ?').bind(clientId, legacyKey).first<{ id: string; create_request_hash: string }>();
+}
 function isReadOnlyTaskType(value: string): value is TaskType { return Object.prototype.hasOwnProperty.call(TASK_CAPABILITIES, value) && TASK_CAPABILITIES[value as TaskType].effectClass === 'read_only'; }
 function retryDelayMinutes(attempts: number) { return Math.min(MAX_RETRY_DELAY_MINUTES, 5 * 2 ** Math.max(0, attempts - 1)); }
 function classifyErrorPayload(error: unknown) { return error instanceof Error ? { code: error instanceof BridgeError ? error.code : 'executor_error', message: error.message.slice(0, 500) } : { code: 'executor_error', message: 'Executor reported a failure.' }; }

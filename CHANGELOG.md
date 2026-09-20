@@ -1,10 +1,19 @@
 # Changelog
 
+## v0.4.0 — 2026-09-20
+
+- Added managed, scoped caller identities for trusted local Codex, Claude Code, and Cursor MCP clients.
+- Added owner-scoped task visibility and client-namespaced task idempotency while retaining existing Codex task data and token fallback compatibility.
+- Added a credential-free stdio-to-HTTP MCP proxy plus multi-agent installation, backup, and rollback guidance.
+- Kept Grok Bot as the sole executor; cross-agent delegation and additional executors remain out of scope.
+
 ## v0.3.0 — 2026-09-19
 
 - Added the optional `grok-task-continuation` Codex Skill for per-task continuation after a Grok bridge task reaches a terminal state.
 - Documented the scoped heartbeat pattern: poll only known task IDs, treat `get_task` as authoritative, preserve evidence and limitations, and continue the original Codex request rather than stop at a status notification.
 - Clarified the platform boundary: this client-side continuation does not make the Worker or Grok Bot capable of waking arbitrary Codex conversations.
+- Published the v0.3.0 release after passing type checks, the test suite, Worker dry-run build, and Skill validation.
+- The project is now listed through the merged Awesome AI Plugins contribution; a follow-up documentation-only pull request notes the optional Codex-side continuation workflow.
 
 ## v0.2.0 — 2026-09-19
 

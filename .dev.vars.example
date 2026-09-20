@@ -1,6 +1,9 @@
 ENVIRONMENT=local
 PUBLIC_BASE_URL=http://localhost:8787
 CODEX_TOKEN=replace-with-a-long-random-token
+# Optional v0.4 caller registry. When set, it replaces CODEX_TOKEN for caller
+# authentication. Add a valid JSON registry with SHA-256 digests only; never
+# place raw caller tokens here. See docs/multi-agent-callers.md.
 GROK_TOKEN=replace-with-a-third-long-random-token
 GROK_OAUTH_LOGIN_CODE=replace-with-a-dedicated-32-byte-random-login-code
 ATTACHMENT_SIGNING_SECRET=replace-with-a-long-random-secret
